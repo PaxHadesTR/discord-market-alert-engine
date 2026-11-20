@@ -294,3 +294,51 @@ async def test_alert_action_buttons_persist_across_bot_restarts(tmp_path):
     inter_dismiss.response.edit_message.assert_awaited_once()
 
     await fresh_bot.close()
+
+
+@pytest.mark.asyncio
+async def test_alert_action_view_enforces_owner_authorization():
+    """SEC-AUTH-004: Non-owner users cannot rearm or dismiss another user's AlertActionView buttons."""
+    from app.bot.client import AlertActionView
+
+    alert = AlertRecord(
+        id=55,
+        user_id="111",
+        user_name="Owner",
+        channel_id="222",
+        guild_id="333",
+        symbol="BTCUSDT",
+        asset_type="CRYPTO",
+        target_price=70000.0,
+        initial_price=65000.0,
+        direction="ABOVE",
+        status="TRIGGERED",
+        created_at="2026-10-29T20:00:00+00:00",
+    )
+    mock_engine = MagicMock()
+    view = AlertActionView(mock_engine, alert)
+
+    # Non-owner attempts rearm -> blocked ephemerally, no modal opened
+    inter_other_rearm = _make_mock_interaction(user_id=999, user_name="Intruder")
+    await view.rearm_button.callback(inter_other_rearm)
+    inter_other_rearm.response.send_modal.assert_not_awaited()
+    inter_other_rearm.response.send_message.assert_awaited_once()
+    assert inter_other_rearm.response.send_message.call_args.kwargs["ephemeral"] is True
+
+    # Non-owner attempts dismiss -> blocked ephemerally, message not edited, view still active
+    inter_other_dismiss = _make_mock_interaction(user_id=999, user_name="Intruder")
+    await view.dismiss_button.callback(inter_other_dismiss)
+    inter_other_dismiss.response.edit_message.assert_not_awaited()
+    inter_other_dismiss.response.send_message.assert_awaited_once()
+    assert inter_other_dismiss.response.send_message.call_args.kwargs["ephemeral"] is True
+    assert view.is_finished() is False
+
+    # Owner succeeds for both rearm and dismiss
+    inter_owner_rearm = _make_mock_interaction(user_id=111, user_name="Owner")
+    await view.rearm_button.callback(inter_owner_rearm)
+    inter_owner_rearm.response.send_modal.assert_awaited_once()
+
+    inter_owner_dismiss = _make_mock_interaction(user_id=111, user_name="Owner")
+    await view.dismiss_button.callback(inter_owner_dismiss)
+    inter_owner_dismiss.response.edit_message.assert_awaited_once()
+    assert view.is_finished() is True

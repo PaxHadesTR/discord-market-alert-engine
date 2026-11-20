@@ -235,6 +235,12 @@ class RearmAlertButton(
                 ephemeral=True,
             )
             return
+        if str(interaction.user.id) != str(alert.user_id):
+            await interaction.response.send_message(
+                "❌ Bu alarm sadece sahibi tarafından yönetilebilir.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_modal(RearmAlertModal(engine, alert))
 
 
@@ -265,6 +271,19 @@ class DismissAlertButton(
 
     async def callback(self, interaction: discord.Interaction) -> None:
         view = self.view
+        engine: Optional[AutonomousAlertEngine] = getattr(view, "engine", None) or getattr(
+            interaction.client, "engine", None
+        )
+        alert: Optional[AlertRecord] = getattr(view, "alert", None)
+        if alert is None and engine is not None:
+            alert = await engine.db.get_alert_by_id(self.alert_id)
+        if alert is not None and str(interaction.user.id) != str(alert.user_id):
+            await interaction.response.send_message(
+                "❌ Bu alarm sadece sahibi tarafından yönetilebilir.",
+                ephemeral=True,
+            )
+            return
+
         if view is not None:
             for child in view.children:
                 if hasattr(child, "disabled"):
