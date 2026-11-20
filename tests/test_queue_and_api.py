@@ -101,3 +101,41 @@ async def test_queue_stop_cancelling_inflight_dispatch_does_not_double_task_done
     await queue.stop()
     assert queue.queue._unfinished_tasks == 0
     assert closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "configured_ws_url",
+    [
+        "wss://custom.binance.example/ws",
+        "wss://custom.binance.example/ws/!miniTicker@arr",
+    ],
+)
+async def test_lifespan_wires_market_feed_settings(monkeypatch, tmp_path, configured_ws_url: str):
+    """F-eb4d08f930e2: lifespan passes YAHOO_POLL_INTERVAL_SECONDS, CACHE_TTL_SECONDS, HTTP_TIMEOUT_SECONDS, and BINANCE_WS_URL."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from fastapi import FastAPI
+    from app.config import get_settings
+    from app.main import lifespan
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "lifespan.db"))
+    monkeypatch.setenv("YAHOO_POLL_INTERVAL_SECONDS", "45.0")
+    monkeypatch.setenv("CACHE_TTL_SECONDS", "12.5")
+    monkeypatch.setenv("HTTP_TIMEOUT_SECONDS", "15.0")
+    monkeypatch.setenv("BINANCE_WS_URL", configured_ws_url)
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "")
+    get_settings.cache_clear()
+
+    test_app = FastAPI()
+    with patch("app.market_data.binance.BinanceMarketFeed.start_stream", MagicMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.start_polling", MagicMock()), \
+         patch("app.market_data.binance.BinanceMarketFeed.stop", AsyncMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.stop", AsyncMock()):
+        async with lifespan(test_app):
+            feed = test_app.state.alert_engine.feed
+            assert feed.cache_ttl == 12.5
+            assert feed.yahoo.poll_interval == 45.0
+            assert feed.yahoo.timeout == 15.0
+            assert feed.binance.timeout == 15.0
+            assert feed.binance.ws_url == "wss://custom.binance.example/ws/!miniTicker@arr"
+            assert feed.binance.ws_url.count("/!miniTicker@arr") == 1
