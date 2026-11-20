@@ -80,3 +80,30 @@ def test_webhook_fails_closed_for_empty_or_placeholder_secret(client: TestClient
 
     resp_path = client.post(f"/webhook/{weak_secret.strip() or 'anything'}", json=payload)
     assert resp_path.status_code == 401
+
+
+def test_verify_secret_uses_constant_time_compare_without_short_circuit(monkeypatch):
+    """SEC-AUTH-002: _verify_secret uses hmac.compare_digest on UTF-8 bytes across all non-None candidates."""
+    import hmac
+    from unittest.mock import MagicMock
+    from app.routes import webhook as webhook_mod
+
+    spy = MagicMock(wraps=hmac.compare_digest)
+    monkeypatch.setattr(webhook_mod.hmac, "compare_digest", spy)
+
+    assert webhook_mod._verify_secret(
+        configured_secret="my_strong_secret_42",
+        path_secret="  my_strong_secret_42  ",
+        query_secret="wrong",
+        header_secret="also_wrong",
+    ) is True
+    # All 3 non-None candidates evaluated without short-circuiting
+    assert spy.call_count == 3
+
+    spy.reset_mock()
+    assert webhook_mod._verify_secret(
+        configured_secret="my_strong_secret_42",
+        query_secret="wrong",
+        payload_passphrase="",
+    ) is False
+    assert spy.call_count == 2

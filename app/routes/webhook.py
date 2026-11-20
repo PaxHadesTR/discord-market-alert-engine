@@ -1,3 +1,4 @@
+import hmac
 import logging
 from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
@@ -29,13 +30,19 @@ def _verify_secret(
         logger.warning("Webhook authentication rejected: WEBHOOK_SECRET is empty or set to an insecure placeholder.")
         return False
 
+    expected_bytes = expected.encode("utf-8")
     candidates = [
         path_secret,
         query_secret,
         header_secret,
         payload_passphrase,
     ]
-    return any(c is not None and c.strip() == expected for c in candidates)
+    matched = False
+    for candidate in candidates:
+        if candidate is not None:
+            candidate_bytes = candidate.strip().encode("utf-8")
+            matched |= hmac.compare_digest(candidate_bytes, expected_bytes)
+    return matched
 
 
 @router.post("/webhook", status_code=status.HTTP_202_ACCEPTED)
