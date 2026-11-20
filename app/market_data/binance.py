@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from typing import Callable, Coroutine, Dict, Optional
+from typing import Callable, Coroutine, List, Optional, Tuple
 import httpx
 import websockets
 
@@ -16,12 +16,18 @@ class BinanceMarketFeed:
         ws_url: str = "wss://stream.binance.com:9443/ws/!miniTicker@arr",
         rest_api_url: str = "https://api.binance.com/api/v3/ticker/price",
         timeout_seconds: float = 8.0,
+        max_dispatch_queue: int = 4096,
+        dispatch_concurrency: int = 16,
     ) -> None:
         self.ws_url = ws_url
         self.rest_api_url = rest_api_url
         self.timeout = timeout_seconds
+        self.max_dispatch_queue = max(1, max_dispatch_queue)
+        self.dispatch_concurrency = max(1, dispatch_concurrency)
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._dispatch_queue: Optional[asyncio.Queue[Tuple[str, float]]] = None
+        self._dispatch_workers: List[asyncio.Task] = []
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -50,19 +56,77 @@ class BinanceMarketFeed:
         if self._running:
             return
         self._running = True
+        self._dispatch_queue = asyncio.Queue(maxsize=self.max_dispatch_queue)
+        self._dispatch_workers = [
+            asyncio.create_task(
+                self._dispatch_worker(on_price_update),
+                name=f"binance_tick_dispatcher_{idx}",
+            )
+            for idx in range(self.dispatch_concurrency)
+        ]
         self._task = asyncio.create_task(self._ws_loop(on_price_update), name="binance_ws_stream")
         logger.info("Started Binance WebSocket background stream on %s", self.ws_url)
 
-    async def stop(self) -> None:
-        """Stop WebSocket background stream and close HTTP client."""
-        self._running = False
-        if self._task:
-            self._task.cancel()
+    def _enqueue_tick(self, symbol: str, price: float) -> None:
+        """Non-blocking bounded enqueue; evicts oldest stale tick on saturation to prevent WS stalls."""
+        if self._dispatch_queue is None:
+            return
+        if self._dispatch_queue.full():
             try:
-                await self._task
-            except asyncio.CancelledError:
+                self._dispatch_queue.get_nowait()
+                self._dispatch_queue.task_done()
+            except asyncio.QueueEmpty:
                 pass
+        try:
+            self._dispatch_queue.put_nowait((symbol, price))
+        except asyncio.QueueFull:
+            logger.debug("Binance tick dispatch queue saturated; dropping tick for %s", symbol)
+
+    async def _dispatch_worker(
+        self,
+        on_price_update: Callable[[str, float], Coroutine[None, None, None]],
+    ) -> None:
+        """Background worker invoking price update callbacks without blocking WebSocket reads."""
+        assert self._dispatch_queue is not None
+        while self._running:
+            try:
+                symbol, price = await self._dispatch_queue.get()
+            except asyncio.CancelledError:
+                break
+            try:
+                await on_price_update(symbol, price)
+            except asyncio.CancelledError:
+                break
+            except Exception as err:
+                logger.debug("Error dispatching Binance tick for %s: %s", symbol, err)
+            finally:
+                self._dispatch_queue.task_done()
+
+    async def stop(self) -> None:
+        """Stop WebSocket background stream, dispatch workers, and close HTTP client."""
+        self._running = False
+        tasks_to_cancel: List[asyncio.Task] = []
+        if self._task:
+            tasks_to_cancel.append(self._task)
             self._task = None
+        if self._dispatch_workers:
+            tasks_to_cancel.extend(self._dispatch_workers)
+            self._dispatch_workers = []
+
+        for task in tasks_to_cancel:
+            task.cancel()
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+        if self._dispatch_queue is not None:
+            while not self._dispatch_queue.empty():
+                try:
+                    self._dispatch_queue.get_nowait()
+                    self._dispatch_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+            self._dispatch_queue = None
+
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
@@ -88,12 +152,20 @@ class BinanceMarketFeed:
                                     s = item.get("s")
                                     c = item.get("c")
                                     if s and c:
-                                        await on_price_update(s.upper(), float(c))
+                                        price = float(c)
+                                        if self._dispatch_queue is not None:
+                                            self._enqueue_tick(s.upper(), price)
+                                        else:
+                                            await on_price_update(s.upper(), price)
                             elif isinstance(data, dict):
                                 s = data.get("s")
                                 c = data.get("c")
                                 if s and c:
-                                    await on_price_update(s.upper(), float(c))
+                                    price = float(c)
+                                    if self._dispatch_queue is not None:
+                                        self._enqueue_tick(s.upper(), price)
+                                    else:
+                                        await on_price_update(s.upper(), price)
                         except Exception as parse_err:
                             logger.debug("Error processing miniTicker tick: %s", parse_err)
 
