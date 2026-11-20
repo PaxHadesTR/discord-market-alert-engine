@@ -1,6 +1,7 @@
 import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
+import discord
 import pytest
 from fastapi.testclient import TestClient
 from app.config import Settings, get_settings
@@ -258,86 +259,69 @@ async def test_healthcheck_bot_ready(monkeypatch):
 # --- 4. Supervisor Reconnection & Provider Update Tests ---
 
 @pytest.mark.asyncio
-async def test_supervisor_reconnect_and_provider_update():
-    """Verify supervisor instantiates a fresh bot on crash and updates queue provider reference."""
-    mock_engine = MagicMock()
-    mock_settings = Settings(DISCORD_BOT_TOKEN="token_abc", DISCORD_ALERT_CHANNEL_ID=999)
+async def test_supervisor_reconnect_and_provider_update(monkeypatch, tmp_path):
+    """TEST-SUPERVISOR-002: Real app.main.lifespan supervisor creates a fresh bot on crash and updates provider.bot."""
+    from app.main import lifespan
 
-    provider = DiscordBotNotificationProvider(bot=None, channel_id=999)
-    providers = [provider]
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "sup_reconnect.db"))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "valid_token_abc_123")
+    monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", "999")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "")
+    get_settings.cache_clear()
 
+    app = create_app()
     created_bots = []
     attempt_count = 0
     second_attempt_event = asyncio.Event()
-    shutdown_event = asyncio.Event()
+    release_second_bot = asyncio.Event()
 
     async def mock_start(token):
         nonlocal attempt_count
         attempt_count += 1
         if attempt_count == 1:
             raise ConnectionResetError("WARP proxy 503 dropped connection")
-        else:
-            second_attempt_event.set()
-            await shutdown_event.wait()
+        second_attempt_event.set()
+        await release_second_bot.wait()
 
-    with patch("app.main.DiscordAlertBot") as MockBotCls:
-        def make_bot(*args, **kwargs):
-            b = MagicMock()
-            b.is_closed.return_value = False
-            b.close = AsyncMock()
-            b.start = AsyncMock(side_effect=mock_start)
-            created_bots.append(b)
-            return b
+    orig_wait_for = asyncio.wait_for
 
-        MockBotCls.side_effect = make_bot
+    async def fast_wait_for(coro, timeout=None):
+        effective = min(timeout, 0.02) if timeout is not None and timeout >= 5.0 else timeout
+        return await orig_wait_for(coro, timeout=effective)
 
-        # We simulate the supervisor loop with accelerated backoff for the test
-        async def run_supervisor():
-            backoff_steps = [0.01, 0.02]
-            backoff_idx = 0
-            while not shutdown_event.is_set():
-                current_bot = MockBotCls(engine=mock_engine, settings=mock_settings)
-                for p in providers:
-                    if isinstance(p, DiscordBotNotificationProvider):
-                        p.bot = current_bot
-                try:
-                    await current_bot.start("token_abc")
-                except asyncio.CancelledError:
-                    break
-                except Exception:
-                    pass
-                finally:
-                    if current_bot and not current_bot.is_closed():
-                        await current_bot.close()
+    def make_bot(*args, **kwargs):
+        b = MagicMock()
+        b.is_closed.return_value = False
 
-                if shutdown_event.is_set():
-                    break
-                delay = backoff_steps[min(backoff_idx, len(backoff_steps) - 1)]
-                backoff_idx += 1
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
-                    break
-                except asyncio.TimeoutError:
-                    pass
+        async def _close():
+            b.is_closed.return_value = True
+            release_second_bot.set()
 
-        sup_task = asyncio.create_task(run_supervisor())
+        b.close = AsyncMock(side_effect=_close)
+        b.start = AsyncMock(side_effect=mock_start)
+        created_bots.append(b)
+        return b
 
-        # Wait until attempt 2 connects
-        await asyncio.wait_for(second_attempt_event.wait(), timeout=2.0)
+    with patch("app.main.DiscordAlertBot", side_effect=make_bot), \
+         patch("app.main.asyncio.wait_for", side_effect=fast_wait_for), \
+         patch("app.market_data.binance.BinanceMarketFeed.start_stream", MagicMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.start_polling", MagicMock()), \
+         patch("app.market_data.binance.BinanceMarketFeed.stop", AsyncMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.stop", AsyncMock()):
+        async with lifespan(app):
+            await orig_wait_for(second_attempt_event.wait(), timeout=2.0)
 
-        # Verify 2 distinct bot instances were created
-        assert len(created_bots) >= 2
-        assert created_bots[0] != created_bots[1]
+            assert len(created_bots) >= 2
+            assert created_bots[0] is not created_bots[1]
+            created_bots[0].close.assert_awaited()
+            assert app.state.discord_bot is created_bots[1]
 
-        # Verify provider reference was updated to the latest bot
-        assert provider.bot == created_bots[1]
-
-        # Verify old bot close was called
-        created_bots[0].close.assert_awaited()
-
-        # Clean shutdown
-        shutdown_event.set()
-        await sup_task
+            bot_providers = [
+                p for p in app.state.queue_service.providers
+                if isinstance(p, DiscordBotNotificationProvider)
+            ]
+            assert len(bot_providers) == 1
+            assert bot_providers[0].bot is created_bots[1]
 
 
 @pytest.mark.asyncio
@@ -510,46 +494,43 @@ async def test_healthcheck_startup_grace_period_uninitialized_and_closed(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_supervisor_aborts_on_fatal_login_failure():
-    """Verify supervisor aborts on fatal Discord LoginFailure rather than entering an infinite retry loop."""
-    import discord
+@pytest.mark.parametrize(
+    "fatal_exc_factory",
+    [
+        lambda: discord.errors.LoginFailure("Improper token has been passed"),
+        lambda: discord.errors.PrivilegedIntentsRequired(shard_id=None),
+    ],
+)
+async def test_supervisor_aborts_on_fatal_login_failure(monkeypatch, tmp_path, fatal_exc_factory):
+    """TEST-SUPERVISOR-002: Real app.main.lifespan supervisor aborts immediately on LoginFailure / PrivilegedIntentsRequired."""
+    from app.main import lifespan
 
-    mock_engine = MagicMock()
-    mock_settings = Settings(DISCORD_BOT_TOKEN="invalid_token")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "sup_fatal.db"))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "invalid_fatal_token_123")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "")
+    get_settings.cache_clear()
 
-    shutdown_event = asyncio.Event()
-    with patch("app.main.DiscordAlertBot") as MockBotCls:
-        mock_bot = MagicMock()
-        mock_bot.is_closed.return_value = False
-        mock_bot.close = AsyncMock()
-        mock_bot.start = AsyncMock(side_effect=discord.errors.LoginFailure("Improper token has been passed"))
-        MockBotCls.return_value = mock_bot
+    app = create_app()
+    created_bots = []
 
-        # Run supervisor task logic
-        backoff_steps = [0.01, 0.02]
-        backoff_idx = 0
-        task_ran = False
-        async def _run_supervisor():
-            nonlocal task_ran
-            task_ran = True
-            while not shutdown_event.is_set():
-                current_bot = MockBotCls(engine=mock_engine, settings=mock_settings)
-                try:
-                    await current_bot.start("invalid_token")
-                except asyncio.CancelledError:
-                    break
-                except (discord.errors.LoginFailure, discord.errors.PrivilegedIntentsRequired):
-                    break
-                except Exception:
-                    pass
-                finally:
-                    if current_bot and not current_bot.is_closed():
-                        await current_bot.close()
+    def make_bot(*args, **kwargs):
+        b = MagicMock()
+        b.is_closed.return_value = False
+        b.close = AsyncMock()
+        b.start = AsyncMock(side_effect=fatal_exc_factory())
+        created_bots.append(b)
+        return b
 
-        task = asyncio.create_task(_run_supervisor())
-        await asyncio.wait_for(task, timeout=2.0)
-        assert task_ran is True
-        assert task.done() is True
+    with patch("app.main.DiscordAlertBot", side_effect=make_bot), \
+         patch("app.market_data.binance.BinanceMarketFeed.start_stream", MagicMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.start_polling", MagicMock()), \
+         patch("app.market_data.binance.BinanceMarketFeed.stop", AsyncMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.stop", AsyncMock()):
+        async with lifespan(app):
+            await asyncio.wait_for(app.state.discord_bot_task, timeout=2.0)
+            assert app.state.discord_bot_task.done() is True
+            assert len(created_bots) == 1
+            created_bots[0].close.assert_awaited()
 
 
 @pytest.mark.asyncio
