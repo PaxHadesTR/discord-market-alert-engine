@@ -86,7 +86,8 @@ class YahooFinanceFeed:
         if self._running:
             return
         self._running = True
-        self._client = httpx.AsyncClient(headers=HEADERS, timeout=self.timeout)
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(headers=HEADERS, timeout=self.timeout)
         self._task = asyncio.create_task(
             self._poll_loop(get_active_symbols, on_price_update),
             name="yahoo_finance_poller",

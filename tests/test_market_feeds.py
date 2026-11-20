@@ -74,3 +74,35 @@ async def test_binance_ws_reader_not_stalled_by_slow_callback():
         assert binance._task is None
         assert binance._dispatch_workers == []
         assert binance._dispatch_queue is None
+
+
+@pytest.mark.asyncio
+async def test_yahoo_start_polling_reuses_existing_client():
+    """YAHOO-MEM-001: start_polling reuses an already-open AsyncClient instead of leaking it."""
+    import httpx
+    from app.market_data.yahoo import YahooFinanceFeed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"chart": {"result": [{"meta": {"regularMarketPrice": 225.5}}]}})
+
+    feed = YahooFinanceFeed(poll_interval_seconds=60.0)
+    feed._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    existing_client = feed._client
+
+    price = await feed.fetch_price("AAPL")
+    assert price == 225.5
+    assert feed._client is existing_client
+
+    async def get_syms():
+        return []
+
+    async def on_update(sym, p):
+        pass
+
+    feed.start_polling(get_syms, on_update)
+    assert feed._client is existing_client
+    assert not existing_client.is_closed
+
+    await feed.stop()
+    assert existing_client.is_closed
+    assert feed._client is None
