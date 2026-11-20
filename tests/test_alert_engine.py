@@ -229,3 +229,64 @@ async def test_price_feed_cache_freshness():
     # Since yahoo feed is not mocked, it calls fetch_price or returns None/live price
     # Either way, it demonstrates TTL checked
     assert (time.time() - feed.price_cache["AAPL"][1]) > 0.1
+
+
+@pytest.mark.asyncio
+async def test_on_price_tick_skips_sqlite_for_inactive_symbols(setup_engine, monkeypatch):
+    """ENGINE-DB-001: _on_price_tick skips SQLite queries for symbols without active alerts and stays synced."""
+    from datetime import datetime, timezone, timedelta
+    from unittest.mock import MagicMock
+    import aiosqlite
+
+    engine, triggered, feed = setup_engine
+    await engine._refresh_active_symbols()
+
+    connect_spy = MagicMock(wraps=aiosqlite.connect)
+    monkeypatch.setattr(aiosqlite, "connect", connect_spy)
+
+    # Inactive symbols -> zero SQLite connections
+    await engine._on_price_tick("DOGEUSDT", 0.15)
+    await engine._on_price_tick("SHIBUSDT", 0.00002)
+    connect_spy.assert_not_called()
+
+    # Add alert -> BTCUSDT indexed
+    ok, _, rec = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price=70000.0,
+    )
+    assert ok is True
+    assert "BTCUSDT" in engine._active_symbols
+
+    # Direct DB cancel_alert (like DiscordAlertBot) removes BTCUSDT from index
+    assert await engine.db.cancel_alert(rec.id, user_id="u1") is True
+    assert "BTCUSDT" not in engine._active_symbols
+    connect_spy.reset_mock()
+    await engine._on_price_tick("BTCUSDT", 71000.0)
+    connect_spy.assert_not_called()
+
+    # Add another alert, trigger & reset -> index tracks both transitions
+    ok2, _, rec2 = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price=70000.0,
+    )
+    assert ok2 is True
+    await engine._on_price_tick("BTCUSDT", 71000.0)
+    assert len(triggered) == 1
+    assert "BTCUSDT" not in engine._active_symbols
+
+    assert await engine.db.reset_alert_to_active(rec2.id) is True
+    assert "BTCUSDT" in engine._active_symbols
+
+    # Direct clear_user_alerts removes from index
+    assert await engine.db.clear_user_alerts(user_id="u1", status="ACTIVE") == 1
+    assert "BTCUSDT" not in engine._active_symbols
+
+    # expire_stale_alerts removes from index
+    aid = await engine.db.add_alert("u2", "U2", "c1", None, "ETHUSDT", "CRYPTO", 4000, 3500, "ABOVE")
+    assert "ETHUSDT" in engine._active_symbols
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    async with aiosqlite.connect(engine.db.db_path) as conn:
+        await conn.execute("UPDATE alerts SET created_at = ? WHERE id = ?;", (old_ts, aid))
+        await conn.commit()
+    assert await engine.db.expire_stale_alerts(max_age_days=180) == 1
+    assert "ETHUSDT" not in engine._active_symbols

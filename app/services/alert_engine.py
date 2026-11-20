@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Callable, Coroutine, List, Optional, Tuple, Union
+from typing import Callable, Coroutine, List, Optional, Set, Tuple, Union
 from app.config import Settings
 from app.database.db import AlertDatabase, AlertRecord
 from app.market_data.feed import UnifiedPriceFeed
@@ -84,10 +84,75 @@ class AutonomousAlertEngine:
         self.trigger_callback = trigger_callback
         self._running = False
         self._expiry_task: Optional[asyncio.Task] = None
+        self._active_symbols: Optional[Set[str]] = None
+        self._hook_db_mutations()
 
         # Wire price feed to evaluate alerts
         self.feed.add_listener(self._on_price_tick)
         self.feed.set_active_equity_supplier(self._get_active_non_crypto_symbols)
+
+    async def _refresh_active_symbols(self) -> Set[str]:
+        """Synchronize the in-memory set of symbols that currently have ACTIVE alerts."""
+        active = await self.db.get_active_alerts()
+        self._active_symbols = {a.symbol.upper().strip() for a in active}
+        return self._active_symbols
+
+    def _hook_db_mutations(self) -> None:
+        """Keep _active_symbols synchronized even when callers mutate self.db directly."""
+        if getattr(self.db, "_active_symbol_hooks_installed", False):
+            return
+
+        orig_add = self.db.add_alert
+        orig_trigger = self.db.trigger_alert
+        orig_reset = self.db.reset_alert_to_active
+        orig_cancel = self.db.cancel_alert
+        orig_clear = self.db.clear_user_alerts
+        orig_expire = self.db.expire_stale_alerts
+
+        async def _wrapped_add(*args, **kwargs):
+            alert_id = await orig_add(*args, **kwargs)
+            symbol = kwargs.get("symbol") if "symbol" in kwargs else (args[4] if len(args) > 4 else None)
+            if symbol is not None and self._active_symbols is not None:
+                self._active_symbols.add(str(symbol).upper().strip())
+            return alert_id
+
+        async def _wrapped_trigger(*args, **kwargs):
+            res = await orig_trigger(*args, **kwargs)
+            if res and self._active_symbols is not None:
+                await self._refresh_active_symbols()
+            return res
+
+        async def _wrapped_reset(*args, **kwargs):
+            res = await orig_reset(*args, **kwargs)
+            if res and self._active_symbols is not None:
+                await self._refresh_active_symbols()
+            return res
+
+        async def _wrapped_cancel(*args, **kwargs):
+            res = await orig_cancel(*args, **kwargs)
+            if res and self._active_symbols is not None:
+                await self._refresh_active_symbols()
+            return res
+
+        async def _wrapped_clear(*args, **kwargs):
+            count = await orig_clear(*args, **kwargs)
+            if count and self._active_symbols is not None:
+                await self._refresh_active_symbols()
+            return count
+
+        async def _wrapped_expire(*args, **kwargs):
+            count = await orig_expire(*args, **kwargs)
+            if count and self._active_symbols is not None:
+                await self._refresh_active_symbols()
+            return count
+
+        self.db.add_alert = _wrapped_add
+        self.db.trigger_alert = _wrapped_trigger
+        self.db.reset_alert_to_active = _wrapped_reset
+        self.db.cancel_alert = _wrapped_cancel
+        self.db.clear_user_alerts = _wrapped_clear
+        self.db.expire_stale_alerts = _wrapped_expire
+        setattr(self.db, "_active_symbol_hooks_installed", True)
 
     async def _get_active_non_crypto_symbols(self) -> List[str]:
         """Fetch all active non-crypto symbols currently registered in database alerts and watchlists."""
@@ -98,7 +163,12 @@ class AutonomousAlertEngine:
 
     async def _on_price_tick(self, symbol: str, current_price: float) -> None:
         """Evaluate active alerts when a price tick arrives."""
-        active_alerts = await self.db.get_active_alerts(symbol=symbol)
+        norm_symbol = symbol.upper().strip()
+        if self._active_symbols is None:
+            await self._refresh_active_symbols()
+        if norm_symbol not in self._active_symbols:
+            return
+        active_alerts = await self.db.get_active_alerts(symbol=norm_symbol)
         if not active_alerts:
             return
 
@@ -224,6 +294,7 @@ class AutonomousAlertEngine:
             return
         self._running = True
         await self.db.init_db()
+        await self._refresh_active_symbols()
         self.feed.start()
         self._expiry_task = asyncio.create_task(self._expiry_worker(), name="alert_expiry_cleaner")
         logger.info("AutonomousAlertEngine started.")
