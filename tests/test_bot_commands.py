@@ -108,3 +108,61 @@ async def test_list_alerts_handles_zero_current_price():
     assert "Fark:" not in embed.fields[0].value
 
     await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_watchlist_show_bounds_fields_and_fetches_concurrently():
+    """BOT-RES-002: /watchlist show caps at 25 fields with truncation footer, fetches concurrently, isolates errors."""
+    import asyncio
+    from app.bot.client import MAX_WATCHLIST_ITEMS, WATCHLIST_FETCH_CONCURRENCY
+
+    symbols = [f"SYM{i}" for i in range(30)]
+    in_flight = 0
+    peak_in_flight = 0
+
+    async def fake_price(sym: str):
+        nonlocal in_flight, peak_in_flight
+        in_flight += 1
+        peak_in_flight = max(peak_in_flight, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        if sym == "SYM3":
+            raise RuntimeError("Upstream error")
+        return 100.0
+
+    mock_engine = MagicMock()
+    mock_engine.db = MagicMock()
+    mock_engine.db.get_user_watchlist = AsyncMock(return_value=symbols)
+    mock_engine.db.add_to_watchlist = AsyncMock(return_value=True)
+    mock_engine.feed = MagicMock()
+    mock_engine.feed.get_current_price = fake_price
+
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    bot._register_commands()
+
+    wl_group = bot.tree.get_command("watchlist")
+    show_cmd = wl_group.get_command("show")
+    add_cmd = wl_group.get_command("add")
+
+    interaction = _make_mock_interaction(user_id=111)
+    await show_cmd.callback(interaction)
+
+    interaction.followup.send.assert_awaited_once()
+    embed = interaction.followup.send.call_args.kwargs["embed"]
+    assert len(embed.fields) == MAX_WATCHLIST_ITEMS
+    assert "30" in embed.footer.text
+    assert peak_in_flight <= WATCHLIST_FETCH_CONCURRENCY
+    assert peak_in_flight >= 2
+
+    # /watchlist add enforces 25-item cap and rejects invalid traversal symbols
+    interaction_cap = _make_mock_interaction(user_id=111)
+    await add_cmd.callback(interaction_cap, symbol="AAPL")
+    mock_engine.db.add_to_watchlist.assert_not_awaited()
+    assert "limitine" in interaction_cap.followup.send.call_args.kwargs["content"]
+
+    interaction_bad = _make_mock_interaction(user_id=111)
+    await add_cmd.callback(interaction_bad, symbol="../../evil?x=1")
+    mock_engine.db.add_to_watchlist.assert_not_awaited()
+    assert "Geçersiz sembol" in interaction_bad.followup.send.call_args.kwargs["content"]
+
+    await bot.close()

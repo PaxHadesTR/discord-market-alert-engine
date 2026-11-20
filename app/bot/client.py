@@ -11,9 +11,13 @@ from discord.ext import commands
 from app.config import Settings
 from app.database.db import AlertRecord
 from app.market_data.symbols import classify_and_normalize, get_symbol_autocomplete
+from app.market_data.yahoo import is_valid_yahoo_symbol
 from app.services.alert_engine import AutonomousAlertEngine
 
 logger = logging.getLogger(__name__)
+
+MAX_WATCHLIST_ITEMS = 25
+WATCHLIST_FETCH_CONCURRENCY = 8
 
 
 def format_price(price: Optional[float]) -> str:
@@ -645,11 +649,28 @@ class DiscordAlertBot(commands.Bot):
                 timestamp=datetime.now(),
             )
 
-            for sym in symbols:
-                price = await self.engine.feed.get_current_price(sym)
+            displayed_symbols = symbols[:MAX_WATCHLIST_ITEMS]
+            semaphore = asyncio.Semaphore(WATCHLIST_FETCH_CONCURRENCY)
+
+            async def _fetch_one(sym: str) -> Optional[float]:
+                async with semaphore:
+                    return await self.engine.feed.get_current_price(sym)
+
+            results = await asyncio.gather(
+                *[_fetch_one(sym) for sym in displayed_symbols],
+                return_exceptions=True,
+            )
+
+            for sym, res in zip(displayed_symbols, results):
+                price = None if isinstance(res, Exception) else res
                 embed.add_field(name=f"🔹 {sym}", value=f"`{format_price(price)}`", inline=True)
 
-            embed.set_footer(text=f"Toplam: {len(symbols)} varlık • /watchlist")
+            if len(symbols) > MAX_WATCHLIST_ITEMS:
+                embed.set_footer(
+                    text=f"İlk {MAX_WATCHLIST_ITEMS} / {len(symbols)} varlık gösteriliyor (kısaltıldı) • /watchlist"
+                )
+            else:
+                embed.set_footer(text=f"Toplam: {len(symbols)} varlık • /watchlist")
             await safe_followup_send(interaction, embed=embed)
 
         # --- /watchlist add ---
@@ -659,6 +680,30 @@ class DiscordAlertBot(commands.Bot):
         async def watchlist_add(interaction: discord.Interaction, symbol: str):
             await safe_defer(interaction, ephemeral=True)
             norm_symbol, asset_type = classify_and_normalize(symbol)
+            if not is_valid_yahoo_symbol(norm_symbol):
+                await safe_followup_send(
+                    interaction,
+                    content="❌ Geçersiz sembol formatı. Lütfen geçerli bir sembol girin (örn: BTC, THYAO, GOLD).",
+                    ephemeral=True,
+                )
+                return
+
+            existing = await self.engine.db.get_user_watchlist(str(interaction.user.id))
+            if norm_symbol in existing:
+                await safe_followup_send(
+                    interaction,
+                    content=f"ℹ️ **{norm_symbol}** zaten takip listenizde kayıtlı.",
+                    ephemeral=True,
+                )
+                return
+            if len(existing) >= MAX_WATCHLIST_ITEMS:
+                await safe_followup_send(
+                    interaction,
+                    content=f"❌ Takip listesi limitine ({MAX_WATCHLIST_ITEMS}) ulaştınız. Yeni sembol eklemek için önce `/watchlist remove` kullanın.",
+                    ephemeral=True,
+                )
+                return
+
             success = await self.engine.db.add_to_watchlist(str(interaction.user.id), norm_symbol, asset_type)
 
             if success:
