@@ -208,3 +208,33 @@ async def test_public_commands_block_discord_mention_injection(malicious: str):
     assert malicious not in kwargs_set["content"]
 
     await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_alert_action_view_is_bounded_and_stops_on_dismiss():
+    """BOT-MEM-001: AlertActionView uses a bounded timeout and stops itself on dismiss to prevent ViewStore leaks."""
+    from app.bot.client import AlertActionView
+
+    alert = AlertRecord(
+        id=42,
+        user_id="111",
+        user_name="Trader",
+        channel_id="222",
+        guild_id=None,
+        symbol="BTCUSDT",
+        asset_type="CRYPTO",
+        target_price=70000.0,
+        initial_price=65000.0,
+        direction="ABOVE",
+        status="TRIGGERED",
+        created_at="2026-10-29T20:00:00+00:00",
+    )
+    mock_engine = MagicMock()
+    view = AlertActionView(mock_engine, alert)
+    assert view.timeout is not None and view.timeout > 0
+    assert view.is_finished() is False
+
+    interaction = _make_mock_interaction(user_id=111)
+    await view.dismiss_button.callback(interaction)
+    interaction.response.edit_message.assert_awaited_once()
+    assert view.is_finished() is True

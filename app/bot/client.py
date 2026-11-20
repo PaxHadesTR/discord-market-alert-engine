@@ -199,7 +199,7 @@ class AlertActionView(discord.ui.View):
     """Interactive Discord buttons attached to triggered alert messages."""
 
     def __init__(self, engine: AutonomousAlertEngine, alert: AlertRecord):
-        super().__init__(timeout=None)
+        super().__init__(timeout=3600)
         self.engine = engine
         self.alert = alert
 
@@ -212,6 +212,7 @@ class AlertActionView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(view=self)
+        self.stop()
 
 
 class HelpCategorySelect(discord.ui.Select):
