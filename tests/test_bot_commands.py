@@ -166,3 +166,45 @@ async def test_watchlist_show_bounds_fields_and_fetches_concurrently():
     assert "Geçersiz sembol" in interaction_bad.followup.send.call_args.kwargs["content"]
 
     await bot.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malicious", ["@everyone", "@here", "<@&123456>", "<@999999>"])
+async def test_public_commands_block_discord_mention_injection(malicious: str):
+    """SEC-AUTH-003: /price and /alert set escape mentions and enforce restrictive AllowedMentions."""
+    import discord
+
+    mock_engine = MagicMock()
+    mock_engine.feed = MagicMock()
+    mock_engine.feed.get_current_price = AsyncMock(return_value=None)
+    mock_engine.create_user_alert = AsyncMock(return_value=(False, f"Geçersiz fiyat formatı: '{malicious}'", None))
+
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    bot._register_commands()
+
+    # 1. /price with malicious symbol
+    price_cmd = bot.tree.get_command("price")
+    inter_price = _make_mock_interaction(user_id=111)
+    await price_cmd.callback(inter_price, symbol=malicious)
+
+    kwargs_price = inter_price.followup.send.call_args.kwargs
+    am_price: discord.AllowedMentions = kwargs_price["allowed_mentions"]
+    assert am_price.everyone is False
+    assert am_price.roles is False
+    assert am_price.users is False
+    assert malicious not in kwargs_price["content"]
+
+    # 2. /alert set error path with malicious target_price
+    alert_group = bot.tree.get_command("alert")
+    set_cmd = alert_group.get_command("set")
+    inter_set = _make_mock_interaction(user_id=111)
+    await set_cmd.callback(inter_set, symbol="BTC", target_price=malicious)
+
+    kwargs_set = inter_set.followup.send.call_args.kwargs
+    am_set: discord.AllowedMentions = kwargs_set["allowed_mentions"]
+    assert am_set.everyone is False
+    assert am_set.roles is False
+    assert am_set.users is False
+    assert malicious not in kwargs_set["content"]
+
+    await bot.close()

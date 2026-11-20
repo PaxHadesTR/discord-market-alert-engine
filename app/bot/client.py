@@ -20,6 +20,12 @@ MAX_WATCHLIST_ITEMS = 25
 WATCHLIST_FETCH_CONCURRENCY = 8
 
 
+def _sanitize_mentions(text: str) -> str:
+    """Escape @everyone/@here as well as raw <@user>/<@&role> mention syntax."""
+    escaped = discord.utils.escape_mentions(str(text))
+    return escaped.replace("<@", "<\u200b@")
+
+
 def format_price(price: Optional[float]) -> str:
     """Format price nicely for both small crypto fractions and large indices."""
     if price is None:
@@ -65,6 +71,7 @@ async def safe_followup_send(
     **kwargs,
 ) -> Optional[discord.WebhookMessage]:
     """Safely send followup message with retry on transient proxy errors."""
+    kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
     for attempt in range(1, max_retries + 1):
         try:
             return await interaction.followup.send(**kwargs)
@@ -379,7 +386,12 @@ class DiscordAlertBot(commands.Bot):
     def __init__(self, engine: AutonomousAlertEngine, settings: Settings):
         intents = discord.Intents.default()
         proxy_url = (settings.DISCORD_PROXY or "").strip() or None
-        super().__init__(command_prefix="!", intents=intents, proxy=proxy_url)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            proxy=proxy_url,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         self.engine = engine
         self.settings = settings
         self.start_time = time.time()
@@ -499,7 +511,12 @@ class DiscordAlertBot(commands.Bot):
             )
 
             if not success or not record:
-                await safe_followup_send(interaction, content=f"❌ {msg}")
+                safe_msg = _sanitize_mentions(msg)
+                await safe_followup_send(
+                    interaction,
+                    content=f"❌ {safe_msg}",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 return
 
             direction_tr = "🟢 Yükseliş Kırılımı (ABOVE)" if record.direction == "ABOVE" else "🔴 Düşüş Kırılımı (BELOW)"
@@ -526,7 +543,12 @@ class DiscordAlertBot(commands.Bot):
                 embed.add_field(name="📝 Not", value=f"> {record.note}", inline=False)
             embed.set_footer(text=f"Alarm ID: #{record.id} • {record.asset_type}{dm_badge}")
 
-            await safe_followup_send(interaction, content=f"{interaction.user.mention}", embed=embed)
+            await safe_followup_send(
+                interaction,
+                content=f"{interaction.user.mention}",
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[interaction.user]),
+            )
 
         # --- /alert list ---
         @alert_group.command(name="list", description="Kurduğunuz alarmları listeler ve tek tıkla silme menüsü sunar")
@@ -613,7 +635,12 @@ class DiscordAlertBot(commands.Bot):
             norm_symbol, _ = classify_and_normalize(symbol)
             current_price = await self.engine.feed.get_current_price(symbol)
             if current_price is None:
-                await safe_followup_send(interaction, content=f"❌ **{symbol}** için anlık fiyat alınamadı.")
+                safe_sym = _sanitize_mentions(symbol)
+                await safe_followup_send(
+                    interaction,
+                    content=f"❌ **{safe_sym}** için anlık fiyat alınamadı.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 return
 
             display_title = symbol.upper().strip()
@@ -848,9 +875,14 @@ class DiscordAlertBot(commands.Bot):
                 return False
 
         delivered = False
+        owner_mention_policy = discord.AllowedMentions(
+            everyone=False,
+            roles=False,
+            users=[discord.Object(id=int(alert.user_id))],
+        )
         for attempt in range(1, 4):
             try:
-                await channel.send(content=content, embed=embed, view=view)
+                await channel.send(content=content, embed=embed, view=view, allowed_mentions=owner_mention_policy)
                 logger.info("Successfully announced alert #%d in Discord channel %s", alert.id, target_channel_id)
                 delivered = True
                 break
