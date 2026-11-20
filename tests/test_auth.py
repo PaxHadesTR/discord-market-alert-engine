@@ -107,3 +107,41 @@ def test_verify_secret_uses_constant_time_compare_without_short_circuit(monkeypa
         payload_passphrase="",
     ) is False
     assert spy.call_count == 2
+
+
+def test_webhook_rejects_oversized_body_before_parsing(client: TestClient, monkeypatch):
+    """SEC-DOS-001: Bodies > 64 KiB (with Content-Length or streamed) return 413 without parsing."""
+    from unittest.mock import MagicMock
+    from app.routes import webhook as webhook_mod
+
+    parse_spy = MagicMock(wraps=webhook_mod.parse_tradingview_payload)
+    monkeypatch.setattr(webhook_mod, "parse_tradingview_payload", parse_spy)
+
+    oversized = b"A" * (webhook_mod.MAX_WEBHOOK_BODY_BYTES + 1)
+
+    # 1. Oversized POST /webhook with Content-Length -> 413, parser never called
+    r1 = client.post("/webhook", content=oversized)
+    assert r1.status_code == 413
+    parse_spy.assert_not_called()
+
+    # 2. Oversized POST /webhook/{valid_token} with chunked/streaming generator (no Content-Length) -> 413
+    def _chunk_gen():
+        for _ in range(17):
+            yield b"B" * 4096  # 68 KiB total
+
+    r2 = client.post(f"/webhook/{TEST_SECRET}", content=_chunk_gen())
+    assert r2.status_code == 413
+    parse_spy.assert_not_called()
+
+    # 3. Invalid path/query/header secret short-circuits to 401 before parsing oversized body
+    r3 = client.post("/webhook/bad_token", content=oversized)
+    assert r3.status_code == 401
+    parse_spy.assert_not_called()
+
+    r4 = client.post("/webhook?secret=wrong", content=oversized)
+    assert r4.status_code == 401
+    parse_spy.assert_not_called()
+
+    r5 = client.post("/webhook", content=oversized, headers={"X-Webhook-Secret": "wrong"})
+    assert r5.status_code == 401
+    parse_spy.assert_not_called()
