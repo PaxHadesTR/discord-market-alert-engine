@@ -191,3 +191,78 @@ async def test_yahoo_rejects_url_traversal_and_allows_valid_symbols():
         assert path.startswith("/v8/finance/chart/")
 
     await feed.stop()
+
+
+@pytest.mark.asyncio
+async def test_yahoo_fetch_price_regular_close_fallback_bist_and_errors():
+    """TEST-COVERAGE-003: YahooFinanceFeed covers regularMarketPrice, close fallback, BIST .IS fallback, 404/500/timeout."""
+    import httpx
+    from app.market_data.yahoo import YahooFinanceFeed
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/AAPL"):
+            return httpx.Response(200, json={"chart": {"result": [{"meta": {"regularMarketPrice": 215.75}}]}})
+        if path.endswith("/CLOSEONLY"):
+            return httpx.Response(
+                200,
+                json={
+                    "chart": {
+                        "result": [
+                            {
+                                "meta": {},
+                                "indicators": {"quote": [{"close": [10.0, None, 12.5, None]}]},
+                            }
+                        ]
+                    }
+                },
+            )
+        if path.endswith("/THYAO"):
+            return httpx.Response(404, json={"chart": {"result": None}})
+        if path.endswith("/THYAO.IS"):
+            return httpx.Response(200, json={"chart": {"result": [{"meta": {"regularMarketPrice": 312.4}}]}})
+        if path.endswith("/SERVERERR") or path.endswith("/SERVERERR.IS"):
+            return httpx.Response(500, text="Internal Server Error")
+        if path.endswith("/TIMEOUT") or path.endswith("/TIMEOUT.IS"):
+            raise httpx.ReadTimeout("timed out")
+        return httpx.Response(404)
+
+    feed = YahooFinanceFeed()
+    feed._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    assert await feed.fetch_price("AAPL") == 215.75
+    assert await feed.fetch_price("CLOSEONLY") == 12.5
+    # BIST .IS fallback when direct THYAO returns 404
+    assert await feed.fetch_price("THYAO") == 312.4
+    # HTTP 500 & timeout degrade gracefully to None
+    assert await feed.fetch_price("SERVERERR") is None
+    assert await feed.fetch_price("TIMEOUT") is None
+    assert await feed.fetch_price("UNKNOWN99") is None
+
+    await feed.stop()
+
+
+@pytest.mark.asyncio
+async def test_binance_rest_fetch_price_happy_and_error_paths():
+    """TEST-COVERAGE-003: BinanceMarketFeed REST fetch_price handles 200, 400/500, and network timeouts."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sym = request.url.params.get("symbol")
+        if sym == "BTCUSDT":
+            return httpx.Response(200, json={"symbol": "BTCUSDT", "price": "68420.50"})
+        if sym == "ERRUSDT":
+            return httpx.Response(500, text="Binance error")
+        if sym == "TIMEOUTUSDT":
+            raise httpx.ReadTimeout("timeout")
+        return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+
+    feed = BinanceMarketFeed()
+    feed._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    assert await feed.fetch_price("btcusdt") == 68420.50
+    assert await feed.fetch_price("ERRUSDT") is None
+    assert await feed.fetch_price("TIMEOUTUSDT") is None
+    assert await feed.fetch_price("INVALID") is None
+
+    await feed.stop()

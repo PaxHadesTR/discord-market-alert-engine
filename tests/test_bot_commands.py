@@ -342,3 +342,81 @@ async def test_alert_action_view_enforces_owner_authorization():
     await view.dismiss_button.callback(inter_owner_dismiss)
     inter_owner_dismiss.response.edit_message.assert_awaited_once()
     assert view.is_finished() is True
+
+
+@pytest.mark.asyncio
+async def test_slash_commands_and_rearm_modal_happy_paths():
+    """TEST-COVERAGE-003: Cover /alert set, /alert delete, /alert clear, /price, /stats, /help, and RearmAlertModal."""
+    from app.bot.client import RearmAlertModal
+
+    record = AlertRecord(
+        id=10,
+        user_id="111",
+        user_name="Trader",
+        channel_id="222",
+        guild_id=None,
+        symbol="BTCUSDT",
+        asset_type="CRYPTO",
+        target_price=72000.0,
+        initial_price=68000.0,
+        direction="ABOVE",
+        status="ACTIVE",
+        created_at="2026-10-29T20:00:00+00:00",
+        note="Breakout",
+    )
+
+    mock_engine = MagicMock()
+    mock_engine.create_user_alert = AsyncMock(return_value=(True, "OK", record))
+    mock_engine.db = MagicMock()
+    mock_engine.db.cancel_alert = AsyncMock(return_value=True)
+    mock_engine.db.clear_user_alerts = AsyncMock(return_value=2)
+    mock_engine.db.get_database_stats = AsyncMock(
+        return_value={"active_alerts": 3, "triggered_alerts": 5, "watchlist_items": 4}
+    )
+    mock_engine.feed = MagicMock()
+    mock_engine.feed.get_current_price = AsyncMock(return_value=68000.0)
+
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    bot._register_commands()
+
+    # /alert set happy path
+    alert_group = bot.tree.get_command("alert")
+    inter_set = _make_mock_interaction(user_id=111)
+    await alert_group.get_command("set").callback(inter_set, symbol="BTC", target_price="72000", note="Breakout", dm=False)
+    inter_set.followup.send.assert_awaited_once()
+    assert "BTCUSDT" in inter_set.followup.send.call_args.kwargs["embed"].title
+
+    # /alert delete happy path
+    inter_del = _make_mock_interaction(user_id=111)
+    await alert_group.get_command("delete").callback(inter_del, alert_id=10)
+    mock_engine.db.cancel_alert.assert_awaited_once_with(alert_id=10, user_id="111")
+
+    # /alert clear happy path
+    inter_clr = _make_mock_interaction(user_id=111)
+    await alert_group.get_command("clear").callback(inter_clr, scope="TRIGGERED")
+    mock_engine.db.clear_user_alerts.assert_awaited_once_with(user_id="111", status="TRIGGERED")
+
+    # /price happy path
+    inter_price = _make_mock_interaction(user_id=111)
+    await bot.tree.get_command("price").callback(inter_price, symbol="BTC")
+    assert "BTC" in inter_price.followup.send.call_args.kwargs["embed"].title
+
+    # /stats and /help happy paths
+    inter_stats = _make_mock_interaction(user_id=111)
+    await bot.tree.get_command("stats").callback(inter_stats)
+    assert len(inter_stats.followup.send.call_args.kwargs["embed"].fields) == 6
+
+    inter_help = _make_mock_interaction(user_id=111)
+    await bot.tree.get_command("help").callback(inter_help)
+    assert inter_help.followup.send.call_args.kwargs["ephemeral"] is True
+
+    # RearmAlertModal submission
+    modal = RearmAlertModal(mock_engine, record)
+    modal.target_price._value = "75000"
+    modal.note._value = "Next leg"
+    inter_modal = _make_mock_interaction(user_id=111)
+    await modal.on_submit(inter_modal)
+    inter_modal.followup.send.assert_awaited_once()
+    assert "yeniden aktif edildi" in inter_modal.followup.send.call_args.kwargs["content"]
+
+    await bot.close()
