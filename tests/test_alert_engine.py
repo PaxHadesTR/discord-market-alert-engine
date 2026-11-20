@@ -213,22 +213,28 @@ async def test_per_user_quota(tmp_path):
 
 @pytest.mark.asyncio
 async def test_price_feed_cache_freshness():
+    """TEST-TTL-001: Verify cache hit before TTL and live refetch + cache update after TTL expires."""
+    import asyncio
     import time
+    from unittest.mock import AsyncMock
+
     feed = UnifiedPriceFeed(cache_ttl_seconds=0.1)
+    feed.yahoo.fetch_price = AsyncMock(return_value=225.0)
     feed.price_cache["AAPL"] = (220.0, time.time())
 
-    # Immediately should return cached
+    # Immediately should return cached without calling upstream fetch_price
     p1 = await feed.get_current_price("AAPL")
     assert p1 == 220.0
+    feed.yahoo.fetch_price.assert_not_awaited()
 
     # Wait for TTL to expire
-    import asyncio
     await asyncio.sleep(0.15)
 
-    # Now cached entry is expired; will trigger live fetch
-    # Since yahoo feed is not mocked, it calls fetch_price or returns None/live price
-    # Either way, it demonstrates TTL checked
-    assert (time.time() - feed.price_cache["AAPL"][1]) > 0.1
+    # After TTL expiry, get_current_price must refetch live price and refresh cache
+    p2 = await feed.get_current_price("AAPL")
+    assert p2 == 225.0
+    feed.yahoo.fetch_price.assert_awaited_once_with("AAPL")
+    assert feed.price_cache["AAPL"][0] == 225.0
 
 
 @pytest.mark.asyncio
