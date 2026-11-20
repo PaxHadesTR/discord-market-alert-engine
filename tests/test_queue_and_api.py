@@ -139,3 +139,16 @@ async def test_lifespan_wires_market_feed_settings(monkeypatch, tmp_path, config
             assert feed.binance.timeout == 15.0
             assert feed.binance.ws_url == "wss://custom.binance.example/ws/!miniTicker@arr"
             assert feed.binance.ws_url.count("/!miniTicker@arr") == 1
+
+
+def test_cors_does_not_reflect_untrusted_origin_with_credentials(client: TestClient):
+    """F-7a56bb60bb7d: Untrusted Origin does not receive wildcard/reflected CORS with credentials."""
+    headers = {"Origin": "https://evil.example"}
+    r_get = client.get("/live", headers=headers)
+    assert r_get.status_code == 200
+    assert r_get.headers.get("access-control-allow-credentials") != "true"
+    assert r_get.headers.get("access-control-allow-origin") not in ("*", "https://evil.example")
+
+    r_opt = client.options("/webhook", headers={**headers, "Access-Control-Request-Method": "POST"})
+    assert r_opt.headers.get("access-control-allow-credentials") != "true"
+    assert r_opt.headers.get("access-control-allow-origin") not in ("*", "https://evil.example")

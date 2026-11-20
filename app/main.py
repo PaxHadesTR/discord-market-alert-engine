@@ -4,7 +4,6 @@ import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 import discord
 from app.bot.client import DiscordAlertBot
 from app.config import get_settings
@@ -216,14 +215,6 @@ def create_app() -> FastAPI:
         description="Unified market price monitor, TradingView webhook ingestion, and interactive Discord bot.",
         version="2.0.0",
         lifespan=lifespan,
-    )
-
-    application.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
     )
 
     application.include_router(health_router)
