@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 from datetime import datetime
 from typing import List, Optional
@@ -499,7 +500,11 @@ class DiscordAlertBot(commands.Bot):
 
             direction_tr = "🟢 Yükseliş Kırılımı (ABOVE)" if record.direction == "ABOVE" else "🔴 Düşüş Kırılımı (BELOW)"
             dm_badge = " • 📬 DM Bildirimi Aktif" if record.notify_dm else ""
-            pct_distance = ((record.target_price - record.initial_price) / record.initial_price) * 100
+            if record.initial_price > 0 and math.isfinite(record.initial_price):
+                pct_distance = ((record.target_price - record.initial_price) / record.initial_price) * 100
+                target_field_val = f"`{format_price(record.target_price)}` (`{pct_distance:+.2f}%`)"
+            else:
+                target_field_val = f"`{format_price(record.target_price)}`"
 
             embed = discord.Embed(
                 title=f"🎯 Alarm Kuruldu: {record.symbol}",
@@ -509,7 +514,7 @@ class DiscordAlertBot(commands.Bot):
             embed.add_field(name="💵 Güncel Fiyat", value=f"`{format_price(record.initial_price)}`", inline=True)
             embed.add_field(
                 name="🎯 Hedef Fiyat",
-                value=f"`{format_price(record.target_price)}` (`{pct_distance:+.2f}%`)",
+                value=target_field_val,
                 inline=True,
             )
             embed.add_field(name="📊 Beklenen Yön", value=f"`{direction_tr}`", inline=False)
@@ -736,19 +741,23 @@ class DiscordAlertBot(commands.Bot):
 
     async def dispatch_alert_notification(self, alert: AlertRecord, current_price: float) -> bool:
         """Send rich embed notification to target channel or directly via DM. Returns True if delivered, False otherwise."""
-        if self.is_closed():
-            logger.warning("Discord Alert Bot client is closed/reconnecting. Skipping dispatch for alert #%d.", alert.id)
+        if self.is_closed() or not self.is_ready():
+            logger.warning("Discord Alert Bot client is closed or not ready. Skipping dispatch for alert #%d.", alert.id)
             return False
 
         is_bullish = alert.direction == "ABOVE"
         direction_label = "Yükseliş Kırılımı (ABOVE)" if is_bullish else "Düşüş Kırılımı (BELOW)"
         color = 0x00FF88 if is_bullish else 0xFF3366
         icon = "🚀" if is_bullish else "⚠️"
-        pct_change = ((current_price - alert.initial_price) / alert.initial_price) * 100
+        if alert.initial_price > 0 and math.isfinite(alert.initial_price):
+            pct_change = ((current_price - alert.initial_price) / alert.initial_price) * 100
+            pct_suffix = f" (`{pct_change:+.2f}%`)"
+        else:
+            pct_suffix = ""
 
         embed = discord.Embed(
             title=f"{icon} FİYAT ALARMI TETİKLENDİ: {alert.symbol}",
-            description=f"> **{alert.symbol}** hedef fiyata ulaştı! (`{pct_change:+.2f}%`)",
+            description=f"> **{alert.symbol}** hedef fiyata ulaştı!{pct_suffix}",
             color=color,
             timestamp=datetime.now(),
         )
