@@ -1,10 +1,10 @@
 # Architecture Decision Records (ADR)
 
-## ADR-001: Choice of Core Runtime & Web Framework (Python 3.15 + FastAPI)
+## ADR-001: Choice of Core Runtime & Web Framework (Python 3.12 + FastAPI)
 * **Date**: 2026-10-20
 * **Status**: ACCEPTED
-* **Context**: The system must ingest real-time HTTP webhooks from TradingView, validate authentication/payloads, and reliably dispatch alerts under burst conditions without blocking I/O. Target deployment is Coolify.
-* **Decision**: Adopt Python 3.15 with FastAPI and `uvicorn`. Leverage `pydantic` v2 for strict runtime schema validation and `httpx` for non-blocking asynchronous HTTP outbound requests.
+* **Context**: The system must ingest real-time HTTP webhooks from TradingView, validate authentication/payloads, and reliably dispatch alerts under burst conditions without blocking I/O. Target deployment is Coolify (`python:3.12-slim`).
+* **Decision**: Adopt Python 3.12 (`python:3.12-slim` container runtime) with FastAPI and `uvicorn`. Leverage `pydantic` v2 for strict runtime schema validation and `httpx` for non-blocking asynchronous HTTP outbound requests.
 * **Outcome**: Modern asynchronous event handling, automatic OpenAPI/Swagger docs, native typed data structures.
 
 ---
