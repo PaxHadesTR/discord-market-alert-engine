@@ -106,3 +106,44 @@ async def test_yahoo_start_polling_reuses_existing_client():
     await feed.stop()
     assert existing_client.is_closed
     assert feed._client is None
+
+
+@pytest.mark.asyncio
+async def test_yahoo_poll_loop_bounds_concurrency():
+    """YAHOO-RES-001: _poll_loop bounds concurrent outbound requests via Semaphore while updating all symbols."""
+    from app.market_data.yahoo import YahooFinanceFeed
+
+    max_limit = 5
+    feed = YahooFinanceFeed(poll_interval_seconds=60.0, max_concurrent_requests=max_limit)
+
+    in_flight = 0
+    peak_in_flight = 0
+    updated = {}
+    all_done = asyncio.Event()
+    symbols = [f"SYM{i}" for i in range(30)]
+
+    async def fake_fetch_price(symbol: str):
+        nonlocal in_flight, peak_in_flight
+        in_flight += 1
+        peak_in_flight = max(peak_in_flight, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return 100.0 + int(symbol.replace("SYM", ""))
+
+    feed.fetch_price = fake_fetch_price
+
+    async def get_syms():
+        return symbols
+
+    async def on_update(sym: str, price: float):
+        updated[sym] = price
+        if len(updated) == len(symbols):
+            all_done.set()
+
+    feed.start_polling(get_syms, on_update)
+    await asyncio.wait_for(all_done.wait(), timeout=5.0)
+    await feed.stop()
+
+    assert len(updated) == 30
+    assert peak_in_flight <= max_limit
+    assert peak_in_flight >= 2

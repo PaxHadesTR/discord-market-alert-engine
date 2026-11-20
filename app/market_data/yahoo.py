@@ -18,9 +18,11 @@ class YahooFinanceFeed:
         self,
         poll_interval_seconds: float = 20.0,
         timeout_seconds: float = 8.0,
+        max_concurrent_requests: int = 8,
     ) -> None:
         self.poll_interval = poll_interval_seconds
         self.timeout = timeout_seconds
+        self.max_concurrent_requests = max(1, max_concurrent_requests)
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._client: Optional[httpx.AsyncClient] = None
@@ -114,12 +116,18 @@ class YahooFinanceFeed:
         get_active_symbols: Callable[[], Coroutine[None, None, List[str]]],
         on_price_update: Callable[[str, float], Coroutine[None, None, None]],
     ) -> None:
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+
+        async def _bounded_poll(symbol: str) -> None:
+            async with semaphore:
+                await self._poll_symbol(symbol, on_price_update)
+
         while self._running:
             try:
                 symbols = await get_active_symbols()
                 if symbols:
                     logger.debug("Polling Yahoo Finance for %d active symbols: %s", len(symbols), symbols)
-                    tasks = [self._poll_symbol(s, on_price_update) for s in set(symbols)]
+                    tasks = [_bounded_poll(s) for s in set(symbols)]
                     await asyncio.gather(*tasks, return_exceptions=True)
 
             except asyncio.CancelledError:
