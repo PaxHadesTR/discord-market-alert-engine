@@ -377,3 +377,47 @@ async def test_concurrent_create_user_alert_respects_quotas(tmp_path):
     assert u1_ok + u2_ok == 5
     assert await db.count_active_alerts(user_id="u1") == u1_ok
     assert await db.count_active_alerts() == 5
+
+
+@pytest.mark.asyncio
+async def test_non_finite_and_invalid_prices_rejected(setup_engine):
+    """F-07a823ab39eb: Reject inf, -inf, nan, +inf%, infk, 1e309, and non-positive current_price."""
+    from app.services.alert_engine import parse_target_price_input
+
+    engine, _, feed = setup_engine
+
+    bad_inputs = [
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+        "inf",
+        "-inf",
+        "nan",
+        "+inf%",
+        "-inf%",
+        "nan%",
+        "infk",
+        "1e309",
+        True,
+    ]
+    for bad in bad_inputs:
+        val, err = parse_target_price_input(bad, 65000.0)
+        assert val is None, f"Expected rejection for {bad!r}, got {val!r}"
+        assert err is not None
+
+        ok, msg, rec = await engine.create_user_alert(
+            user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+            raw_symbol="BTCUSDT", target_price=bad,
+        )
+        assert ok is False
+        assert rec is None
+
+    # Zero or negative current_price from feed must also be rejected
+    feed.mock_prices["BTCUSDT"] = 0.0
+    ok_zero, _, rec_zero = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price=70000.0,
+    )
+    assert ok_zero is False
+    assert rec_zero is None
+    assert await engine.db.count_active_alerts() == 0

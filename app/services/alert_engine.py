@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 from typing import Callable, Coroutine, List, Optional, Set, Tuple, Union
 from app.config import Settings
 from app.database.db import AlertDatabase, AlertRecord
@@ -19,10 +20,13 @@ def parse_target_price_input(
 
     Returns (calculated_target_price, auto_note_suffix) or (None, error_message).
     """
+    if isinstance(target_input, bool):
+        return None, "Hedef fiyat 0'dan büyük geçerli bir sayı olmalıdır."
+
     if isinstance(target_input, (int, float)):
         val = float(target_input)
-        if val <= 0:
-            return None, "Hedef fiyat 0'dan büyük pozitif bir sayı olmalıdır."
+        if not math.isfinite(val) or val <= 0:
+            return None, "Hedef fiyat 0'dan büyük sonlu ve pozitif bir sayı olmalıdır."
         return val, None
 
     clean = str(target_input).strip()
@@ -40,10 +44,12 @@ def parse_target_price_input(
     if clean.endswith("%"):
         try:
             pct = float(clean[:-1].strip().replace(",", "."))
+            if not math.isfinite(pct):
+                return None, f"Geçersiz yüzde formatı: '{target_input}'. Örnek: +5% veya -3%"
             if pct == 0:
                 return None, "Yüzdesel hedef değişim %0 olamaz."
             calc = current_price * (1.0 + (pct / 100.0))
-            if calc <= 0:
+            if not math.isfinite(calc) or calc <= 0:
                 return None, "Hesaplanan hedef fiyat 0 veya altına düştü."
             return calc, f"({pct:+g}% hedefi)"
         except ValueError:
@@ -61,8 +67,8 @@ def parse_target_price_input(
     clean = clean.replace(" ", "").replace(",", ".")
     try:
         val = float(clean) * multiplier
-        if val <= 0:
-            return None, "Hedef fiyat 0'dan büyük pozitif bir sayı olmalıdır."
+        if not math.isfinite(val) or val <= 0:
+            return None, "Hedef fiyat 0'dan büyük sonlu ve pozitif bir sayı olmalıdır."
         return val, None
     except ValueError:
         return None, f"Geçersiz fiyat formatı: '{target_input}'. Örnekler: 70000, 150.5, +5%, -3%, 70k"
@@ -267,7 +273,7 @@ class AutonomousAlertEngine:
 
         # 4. Retrieve current market price
         current_price = await self.feed.get_current_price(symbol)
-        if current_price is None:
+        if current_price is None or not math.isfinite(current_price) or current_price <= 0:
             return (
                 False,
                 f"**{symbol}** sembolü için anlık fiyat alınamadı. Lütfen sembol adını kontrol edin (örn: BTCUSDT, THYAO, USDTRY, GOLD, NASDAQ).",
