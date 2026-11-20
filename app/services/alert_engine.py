@@ -161,8 +161,24 @@ class AutonomousAlertEngine:
         watchlist_symbols = await self.db.get_all_watchlist_symbols(asset_type="EQUITY_FOREX")
         return list(set(alert_symbols + watchlist_symbols))
 
+    def _is_callback_ready(self) -> bool:
+        """Return True only when a trigger callback is registered and its owner (if any) is ready."""
+        if self.trigger_callback is None:
+            return False
+        cb_owner = getattr(self.trigger_callback, "__self__", None)
+        if cb_owner is not None:
+            is_closed = getattr(cb_owner, "is_closed", None)
+            if callable(is_closed) and is_closed():
+                return False
+            is_ready = getattr(cb_owner, "is_ready", None)
+            if callable(is_ready) and not is_ready():
+                return False
+        return True
+
     async def _on_price_tick(self, symbol: str, current_price: float) -> None:
         """Evaluate active alerts when a price tick arrives."""
+        if not self._is_callback_ready():
+            return
         norm_symbol = symbol.upper().strip()
         if self._active_symbols is None:
             await self._refresh_active_symbols()

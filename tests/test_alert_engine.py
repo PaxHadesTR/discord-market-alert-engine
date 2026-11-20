@@ -290,3 +290,49 @@ async def test_on_price_tick_skips_sqlite_for_inactive_symbols(setup_engine, mon
         await conn.commit()
     assert await engine.db.expire_stale_alerts(max_age_days=180) == 1
     assert "ETHUSDT" not in engine._active_symbols
+
+
+@pytest.mark.asyncio
+async def test_alerts_not_lost_when_callback_missing_or_not_ready(setup_engine):
+    """ENGINE-STARTUP-001: Alerts remain ACTIVE when trigger_callback is None or bot owner is not ready."""
+    engine, triggered, feed = setup_engine
+    ok, _, rec = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price=70000.0,
+    )
+    assert ok is True
+
+    # 1. trigger_callback is None -> alert must remain ACTIVE
+    engine.trigger_callback = None
+    await engine._on_price_tick("BTCUSDT", 75000.0)
+    still_active = await engine.db.get_alert_by_id(rec.id)
+    assert still_active.status == "ACTIVE"
+
+    # 2. Bound callback whose owner has is_closed() == False and is_ready() == False -> must remain ACTIVE
+    class _StubBot:
+        def __init__(self, ready: bool, closed: bool = False):
+            self._ready = ready
+            self._closed = closed
+            self.calls = []
+
+        def is_closed(self) -> bool:
+            return self._closed
+
+        def is_ready(self) -> bool:
+            return self._ready
+
+        async def dispatch(self, alert, price):
+            self.calls.append((alert.id, price))
+            return True
+
+    unready_bot = _StubBot(ready=False, closed=False)
+    engine.trigger_callback = unready_bot.dispatch
+    await engine._on_price_tick("BTCUSDT", 75000.0)
+    assert unready_bot.calls == []
+    assert (await engine.db.get_alert_by_id(rec.id)).status == "ACTIVE"
+
+    # 3. Once bot becomes ready -> alert triggers and dispatches
+    unready_bot._ready = True
+    await engine._on_price_tick("BTCUSDT", 75000.0)
+    assert unready_bot.calls == [(rec.id, 75000.0)]
+    assert (await engine.db.get_alert_by_id(rec.id)).status == "TRIGGERED"
