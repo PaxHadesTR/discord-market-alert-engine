@@ -1,9 +1,21 @@
 import asyncio
 import logging
+import re
 from typing import Callable, Coroutine, List, Optional
+from urllib.parse import quote as url_quote
 import httpx
 
 logger = logging.getLogger(__name__)
+
+VALID_YAHOO_SYMBOL_RE = re.compile(r"^[A-Z0-9.\-=^]{1,20}$")
+
+
+def is_valid_yahoo_symbol(symbol: str) -> bool:
+    """Validate that a normalized symbol matches strict allowlist without path traversal."""
+    cleaned = (symbol or "").upper().strip()
+    if not cleaned or ".." in cleaned:
+        return False
+    return bool(VALID_YAHOO_SYMBOL_RE.fullmatch(cleaned))
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -29,7 +41,10 @@ class YahooFinanceFeed:
 
     async def fetch_price(self, symbol: str) -> Optional[float]:
         """Fetch latest price snapshot for non-crypto symbols (BIST, US Equities, Forex, Gold)."""
-        symbol_clean = symbol.upper().strip()
+        symbol_clean = (symbol or "").upper().strip()
+        if not is_valid_yahoo_symbol(symbol_clean):
+            logger.warning("Rejected invalid Yahoo Finance symbol: %r", symbol)
+            return None
         price = await self._fetch_direct_price(symbol_clean)
         if price is not None:
             return price
@@ -51,7 +66,12 @@ class YahooFinanceFeed:
         return self._client
 
     async def _fetch_direct_price(self, symbol_clean: str) -> Optional[float]:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol_clean}"
+        if not is_valid_yahoo_symbol(symbol_clean):
+            logger.warning("Blocked malformed Yahoo Finance symbol in _fetch_direct_price: %r", symbol_clean)
+            return None
+
+        encoded_symbol = url_quote(symbol_clean, safe="=^.-")
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
         params = {"interval": "1m", "range": "1d"}
 
         try:

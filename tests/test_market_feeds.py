@@ -147,3 +147,47 @@ async def test_yahoo_poll_loop_bounds_concurrency():
     assert len(updated) == 30
     assert peak_in_flight <= max_limit
     assert peak_in_flight >= 2
+
+
+@pytest.mark.asyncio
+async def test_yahoo_rejects_url_traversal_and_allows_valid_symbols():
+    """F-b688e6beb214: Malformed/traversal symbols are rejected without HTTP calls; valid Yahoo symbols succeed."""
+    import httpx
+    from app.market_data.yahoo import YahooFinanceFeed
+
+    requested_paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        return httpx.Response(200, json={"chart": {"result": [{"meta": {"regularMarketPrice": 123.45}}]}})
+
+    feed = YahooFinanceFeed()
+    feed._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    # Adversarial symbols must never trigger outbound requests
+    malicious = [
+        "../../v10/finance/quoteSummary/AAPL",
+        "AAPL?crumb=evil&foo=bar",
+        "AAPL#fragment",
+        "AAPL/extra",
+        "AA PL",
+        "AAPL\r\nX-Injected: 1",
+        "..",
+        "A" * 25,
+    ]
+    for bad in malicious:
+        assert await feed.fetch_price(bad) is None
+        assert await feed._fetch_direct_price(bad) is None
+    assert requested_paths == []
+
+    # Valid Yahoo Finance catalog symbols must continue working
+    valid = ["^NDX", "GC=F", "USDTRY=X", "DX-Y.NYB", "THYAO.IS", "000001.SS"]
+    for sym in valid:
+        price = await feed.fetch_price(sym)
+        assert price == 123.45
+
+    assert len(requested_paths) == len(valid)
+    for path in requested_paths:
+        assert path.startswith("/v8/finance/chart/")
+
+    await feed.stop()
