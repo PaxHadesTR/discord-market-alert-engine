@@ -68,3 +68,36 @@ def test_live_endpoint(client: TestClient):
     response = client.get("/live")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_queue_stop_cancelling_inflight_dispatch_does_not_double_task_done():
+    """LOGIC-QUEUE-001: Cancelling _worker_loop mid-dispatch does not raise ValueError and closes providers."""
+    started = asyncio.Event()
+    never_finish = asyncio.Event()
+    closed = False
+
+    class _BlockingProvider:
+        async def send(self, alert: AlertPayload) -> bool:
+            started.set()
+            await never_finish.wait()
+            return True
+
+        async def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    provider = _BlockingProvider()
+    queue = AlertQueueService(
+        providers=[provider],
+        rate_limiter=AsyncTokenBucket(rate=1000.0),
+        max_capacity=10,
+    )
+    queue.start()
+    assert queue.enqueue(AlertPayload(ticker="BTCUSDT", action="BUY", price=70000.0)) is True
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    # Stop while worker is suspended inside provider.send() -> must NOT raise ValueError
+    await queue.stop()
+    assert queue.queue._unfinished_tasks == 0
+    assert closed is True

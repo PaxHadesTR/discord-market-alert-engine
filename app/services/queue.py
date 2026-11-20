@@ -97,7 +97,6 @@ class AlertQueueService:
                     self._total_processed += 1
 
             except asyncio.CancelledError:
-                self.queue.task_done()
                 break
             except Exception as e:
                 logger.error("Unexpected error in alert worker loop: %s", e, exc_info=True)
