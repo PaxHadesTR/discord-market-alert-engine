@@ -55,3 +55,28 @@ def test_auth_via_path_token_invalid(client: TestClient):
     payload = {"ticker": "BNBUSDT", "action": "BUY", "price": 590.0}
     response = client.post("/webhook/invalid_secret_token", json=payload)
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "weak_secret",
+    [
+        "",
+        "   ",
+        "change_me_in_production",
+        "your_super_secret_token_here",
+        "buraya_guclu_bir_sifre_veya_token",
+    ],
+)
+def test_webhook_fails_closed_for_empty_or_placeholder_secret(client: TestClient, monkeypatch, weak_secret: str):
+    """F-61fc1f7627ba: Fail-closed when WEBHOOK_SECRET is empty, whitespace, or placeholder."""
+    from app.config import get_settings
+
+    monkeypatch.setenv("WEBHOOK_SECRET", weak_secret)
+    get_settings.cache_clear()
+
+    payload = {"ticker": "BTCUSDT", "action": "BUY", "price": 65000.0, "passphrase": weak_secret}
+    resp_root = client.post("/webhook", json=payload)
+    assert resp_root.status_code == 401
+
+    resp_path = client.post(f"/webhook/{weak_secret.strip() or 'anything'}", json=payload)
+    assert resp_path.status_code == 401

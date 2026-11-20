@@ -9,6 +9,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Webhook"])
 
 
+INSECURE_DEFAULT_SECRETS = frozenset({
+    "change_me_in_production",
+    "your_super_secret_token_here",
+    "buraya_guclu_bir_sifre_veya_token",
+})
+
+
 def _verify_secret(
     configured_secret: str,
     path_secret: Optional[str] = None,
@@ -16,10 +23,11 @@ def _verify_secret(
     header_secret: Optional[str] = None,
     payload_passphrase: Optional[str] = None,
 ) -> bool:
-    """Validate incoming secret against configured WEBHOOK_SECRET."""
-    # If no secret configured or default disabled, allow (with warning)
-    if not configured_secret or configured_secret == "change_me_in_production":
-        return True
+    """Validate incoming secret against configured WEBHOOK_SECRET (fail-closed)."""
+    expected = (configured_secret or "").strip()
+    if not expected or expected.lower() in INSECURE_DEFAULT_SECRETS:
+        logger.warning("Webhook authentication rejected: WEBHOOK_SECRET is empty or set to an insecure placeholder.")
+        return False
 
     candidates = [
         path_secret,
@@ -27,7 +35,7 @@ def _verify_secret(
         header_secret,
         payload_passphrase,
     ]
-    return any(c is not None and c.strip() == configured_secret for c in candidates)
+    return any(c is not None and c.strip() == expected for c in candidates)
 
 
 @router.post("/webhook", status_code=status.HTTP_202_ACCEPTED)
