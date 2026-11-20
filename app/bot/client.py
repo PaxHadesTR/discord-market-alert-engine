@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import re
 import time
 from datetime import datetime
 from typing import List, Optional
@@ -195,6 +196,102 @@ class AlertListView(discord.ui.View):
             self.add_item(AlertDeleteDropdown(engine, active_alerts, user_id))
 
 
+class RearmAlertButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"btn_rearm:(?P<id>[0-9]+)",
+):
+    """Stateless persistent button that resolves AlertRecord from SQLite across bot restarts."""
+
+    def __init__(self, alert_id: int) -> None:
+        self.alert_id = alert_id
+        super().__init__(
+            discord.ui.Button(
+                label="🔄 Yeniden Kur",
+                style=discord.ButtonStyle.green,
+                custom_id=f"btn_rearm:{alert_id}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Button,
+        match: re.Match[str],
+    ) -> "RearmAlertButton":
+        return cls(int(match["id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        engine: Optional[AutonomousAlertEngine] = getattr(view, "engine", None) or getattr(
+            interaction.client, "engine", None
+        )
+        alert: Optional[AlertRecord] = getattr(view, "alert", None)
+        if alert is None and engine is not None:
+            alert = await engine.db.get_alert_by_id(self.alert_id)
+        if engine is None or alert is None:
+            await interaction.response.send_message(
+                "ℹ️ Bu alarm kaydı artık bulunamadı (silinmiş veya temizlenmiş olabilir).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(RearmAlertModal(engine, alert))
+
+
+class DismissAlertButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"btn_dismiss:(?P<id>[0-9]+)",
+):
+    """Stateless persistent dismiss button working even after bot restarts."""
+
+    def __init__(self, alert_id: int) -> None:
+        self.alert_id = alert_id
+        super().__init__(
+            discord.ui.Button(
+                label="🗑 Kapat",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"btn_dismiss:{alert_id}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Button,
+        match: re.Match[str],
+    ) -> "DismissAlertButton":
+        return cls(int(match["id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if view is not None:
+            for child in view.children:
+                if hasattr(child, "disabled"):
+                    child.disabled = True
+            await interaction.response.edit_message(view=view)
+            view.stop()
+        else:
+            disabled_view = discord.ui.View(timeout=0)
+            disabled_view.add_item(
+                discord.ui.Button(
+                    label="🔄 Yeniden Kur",
+                    style=discord.ButtonStyle.green,
+                    custom_id=f"btn_rearm:{self.alert_id}",
+                    disabled=True,
+                )
+            )
+            disabled_view.add_item(
+                discord.ui.Button(
+                    label="🗑 Kapat",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"btn_dismiss:{self.alert_id}",
+                    disabled=True,
+                )
+            )
+            await interaction.response.edit_message(view=disabled_view)
+
+
 class AlertActionView(discord.ui.View):
     """Interactive Discord buttons attached to triggered alert messages."""
 
@@ -202,17 +299,10 @@ class AlertActionView(discord.ui.View):
         super().__init__(timeout=3600)
         self.engine = engine
         self.alert = alert
-
-    @discord.ui.button(label="🔄 Yeniden Kur", style=discord.ButtonStyle.green, custom_id="btn_rearm")
-    async def rearm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RearmAlertModal(self.engine, self.alert))
-
-    @discord.ui.button(label="🗑 Kapat", style=discord.ButtonStyle.secondary, custom_id="btn_dismiss")
-    async def dismiss_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(view=self)
-        self.stop()
+        self.rearm_button = RearmAlertButton(alert.id)
+        self.dismiss_button = DismissAlertButton(alert.id)
+        self.add_item(self.rearm_button)
+        self.add_item(self.dismiss_button)
 
 
 class HelpCategorySelect(discord.ui.Select):
@@ -403,8 +493,9 @@ class DiscordAlertBot(commands.Bot):
             logger.info("Discord Bot configured with outbound proxy: %s", proxy_url)
 
     async def setup_hook(self) -> None:
-        """Register slash command groups and sync tree."""
+        """Register persistent dynamic items, slash command groups, and sync tree."""
         global _commands_synced_globally
+        self.add_dynamic_items(RearmAlertButton, DismissAlertButton)
         self._register_commands()
         self._setup_error_handler()
         if not _commands_synced_globally:

@@ -238,3 +238,59 @@ async def test_alert_action_view_is_bounded_and_stops_on_dismiss():
     await view.dismiss_button.callback(interaction)
     interaction.response.edit_message.assert_awaited_once()
     assert view.is_finished() is True
+
+
+@pytest.mark.asyncio
+async def test_alert_action_buttons_persist_across_bot_restarts(tmp_path):
+    """LOGIC-BOT-004: setup_hook registers DynamicItems encoding alert.id that resolve records after restart."""
+    import re
+    from app.bot.client import AlertActionView, DismissAlertButton, RearmAlertButton
+    from app.database.db import AlertDatabase
+
+    db = AlertDatabase(str(tmp_path / "persist_buttons.db"))
+    await db.init_db()
+    aid = await db.add_alert(
+        user_id="111", user_name="Trader", channel_id="222", guild_id=None,
+        symbol="BTCUSDT", asset_type="CRYPTO", target_price=70000.0, initial_price=65000.0, direction="ABOVE",
+    )
+    record = await db.get_alert_by_id(aid)
+
+    mock_engine = MagicMock()
+    mock_engine.db = db
+
+    # 1. AlertActionView encodes alert.id in button custom_ids
+    view = AlertActionView(mock_engine, record)
+    assert view.rearm_button.custom_id == f"btn_rearm:{aid}"
+    assert view.dismiss_button.custom_id == f"btn_dismiss:{aid}"
+
+    # 2. Fresh DiscordAlertBot after restart registers dynamic items in setup_hook
+    fresh_bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    with patch.object(fresh_bot.tree, "sync", AsyncMock(return_value=[])):
+        await fresh_bot.setup_hook()
+
+    # 3. Dynamic RearmAlertButton resolves record from SQLite on fresh bot and opens RearmAlertModal
+    match = re.fullmatch(r"btn_rearm:(?P<id>[0-9]+)", f"btn_rearm:{aid}")
+    inter_rearm = _make_mock_interaction(user_id=111)
+    inter_rearm.client = fresh_bot
+    rearm_item = await RearmAlertButton.from_custom_id(inter_rearm, MagicMock(), match)
+    await rearm_item.callback(inter_rearm)
+    inter_rearm.response.send_modal.assert_awaited_once()
+
+    # 4. Deleted/missing alert ID is handled gracefully with ephemeral message
+    match_missing = re.fullmatch(r"btn_rearm:(?P<id>[0-9]+)", "btn_rearm:999999")
+    inter_missing = _make_mock_interaction(user_id=111)
+    inter_missing.client = fresh_bot
+    missing_item = await RearmAlertButton.from_custom_id(inter_missing, MagicMock(), match_missing)
+    await missing_item.callback(inter_missing)
+    inter_missing.response.send_message.assert_awaited_once()
+    assert inter_missing.response.send_message.call_args.kwargs["ephemeral"] is True
+
+    # 5. Dynamic DismissAlertButton works without an in-memory ViewStore entry
+    match_dismiss = re.fullmatch(r"btn_dismiss:(?P<id>[0-9]+)", f"btn_dismiss:{aid}")
+    inter_dismiss = _make_mock_interaction(user_id=111)
+    inter_dismiss.client = fresh_bot
+    dismiss_item = await DismissAlertButton.from_custom_id(inter_dismiss, MagicMock(), match_dismiss)
+    await dismiss_item.callback(inter_dismiss)
+    inter_dismiss.response.edit_message.assert_awaited_once()
+
+    await fresh_bot.close()
