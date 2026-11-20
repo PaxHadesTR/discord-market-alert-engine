@@ -553,7 +553,7 @@ class DiscordAlertBot(commands.Bot):
                 dm_str = " 📬" if a.notify_dm else ""
 
                 current_price = await self.engine.feed.get_current_price(a.symbol)
-                if current_price is not None and a.status == "ACTIVE":
+                if current_price is not None and math.isfinite(current_price) and current_price > 0 and a.status == "ACTIVE":
                     pct_distance = ((a.target_price - current_price) / current_price) * 100
                     dist_str = f" (Fark: `{pct_distance:+.2f}%`)"
                     price_line = f"Anlık: `{format_price(current_price)}`{dist_str} | Başlangıç: `{format_price(a.initial_price)}`"
