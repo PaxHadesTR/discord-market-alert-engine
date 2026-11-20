@@ -85,11 +85,21 @@ class AutonomousAlertEngine:
         self._running = False
         self._expiry_task: Optional[asyncio.Task] = None
         self._active_symbols: Optional[Set[str]] = None
+        self._create_lock: Optional[asyncio.Lock] = None
+        self._create_lock_loop: Optional[asyncio.AbstractEventLoop] = None
         self._hook_db_mutations()
 
         # Wire price feed to evaluate alerts
         self.feed.add_listener(self._on_price_tick)
         self.feed.set_active_equity_supplier(self._get_active_non_crypto_symbols)
+
+    def _get_create_lock(self) -> asyncio.Lock:
+        """Return an asyncio.Lock bound to the active event loop for atomic quota+insert."""
+        loop = asyncio.get_running_loop()
+        if self._create_lock is None or self._create_lock_loop is not loop:
+            self._create_lock = asyncio.Lock()
+            self._create_lock_loop = loop
+        return self._create_lock
 
     async def _refresh_active_symbols(self) -> Set[str]:
         """Synchronize the in-memory set of symbols that currently have ACTIVE alerts."""
@@ -286,20 +296,37 @@ class AutonomousAlertEngine:
                 None,
             )
 
-        # 7. Insert alert into database
-        alert_id = await self.db.add_alert(
-            user_id=user_id,
-            user_name=user_name,
-            channel_id=channel_id,
-            guild_id=guild_id,
-            symbol=symbol,
-            asset_type=asset_type,
-            target_price=calc_target,
-            initial_price=current_price,
-            direction=direction,
-            note=final_note,
-            notify_dm=notify_dm,
-        )
+        # 7. Atomically re-verify quotas and insert alert under lock to eliminate TOCTOU races
+        async with self._get_create_lock():
+            total_active = await self.db.count_active_alerts()
+            if total_active >= self.settings.MAX_ACTIVE_ALERTS:
+                return (
+                    False,
+                    f"Sistem genel alarm kotası dolu! (Aktif: {total_active}/{self.settings.MAX_ACTIVE_ALERTS}). Lütfen eski alarmları temizleyin.",
+                    None,
+                )
+
+            user_active = await self.db.count_active_alerts(user_id=user_id)
+            if user_active >= self.settings.MAX_USER_ACTIVE_ALERTS:
+                return (
+                    False,
+                    f"Kişisel aktif alarm limitinize ({user_active}/{self.settings.MAX_USER_ACTIVE_ALERTS}) ulaştınız! Lütfen `/alert list` veya `/alert clear` ile eski alarmları temizleyin.",
+                    None,
+                )
+
+            alert_id = await self.db.add_alert(
+                user_id=user_id,
+                user_name=user_name,
+                channel_id=channel_id,
+                guild_id=guild_id,
+                symbol=symbol,
+                asset_type=asset_type,
+                target_price=calc_target,
+                initial_price=current_price,
+                direction=direction,
+                note=final_note,
+                notify_dm=notify_dm,
+            )
 
         record = await self.db.get_alert_by_id(alert_id)
         return True, "Alarm başarıyla oluşturuldu.", record

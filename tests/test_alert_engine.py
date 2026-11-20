@@ -336,3 +336,44 @@ async def test_alerts_not_lost_when_callback_missing_or_not_ready(setup_engine):
     await engine._on_price_tick("BTCUSDT", 75000.0)
     assert unready_bot.calls == [(rec.id, 75000.0)]
     assert (await engine.db.get_alert_by_id(rec.id)).status == "TRIGGERED"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_create_user_alert_respects_quotas(tmp_path):
+    """DATA-RACE-001: Concurrent create_user_alert calls with async price delay never exceed user/global quotas."""
+    import asyncio
+
+    class SlowMarketFeed(DummyMarketFeed):
+        async def get_current_price(self, raw_symbol: str):
+            await asyncio.sleep(0.03)
+            return await super().get_current_price(raw_symbol)
+
+    db = AlertDatabase(db_path=str(tmp_path / "race_test.db"))
+    await db.init_db()
+    feed = SlowMarketFeed()
+    settings = Settings(MAX_ACTIVE_ALERTS=5, MAX_USER_ACTIVE_ALERTS=3)
+    engine = AutonomousAlertEngine(db=db, price_feed=feed, settings=settings)
+
+    # Launch 10 simultaneous alert creations across 2 users (6 for u1, 4 for u2)
+    tasks = [
+        engine.create_user_alert(
+            user_id="u1", user_name="User1", channel_id="c1", guild_id="g1",
+            raw_symbol="BTCUSDT", target_price=70000.0 + i,
+        )
+        for i in range(6)
+    ] + [
+        engine.create_user_alert(
+            user_id="u2", user_name="User2", channel_id="c1", guild_id="g1",
+            raw_symbol="BTCUSDT", target_price=71000.0 + i,
+        )
+        for i in range(4)
+    ]
+    results = await asyncio.gather(*tasks)
+
+    u1_ok = sum(1 for ok, _, _ in results[:6] if ok)
+    u2_ok = sum(1 for ok, _, _ in results[6:] if ok)
+    assert u1_ok <= 3
+    assert u2_ok <= 3
+    assert u1_ok + u2_ok == 5
+    assert await db.count_active_alerts(user_id="u1") == u1_ok
+    assert await db.count_active_alerts() == 5
