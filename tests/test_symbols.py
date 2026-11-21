@@ -159,3 +159,17 @@ def test_autocomplete():
     # Custom ticker not in presets returns Custom ticker as 1st option
     custom_res = get_symbol_autocomplete("CUSTOMTICKER123")
     assert custom_res[0][1] == "CUSTOMTICKER123"
+
+
+def test_us_etfs_and_exchange_prefixes():
+    """LOGIC-SYMBOLS-003: US ETFs/equities are not misclassified as crypto/BIST and exchange prefixes are respected."""
+    assert classify_and_normalize("GBTC") == ("GBTC", "EQUITY_FOREX")
+    assert classify_and_normalize("FBTC") == ("FBTC", "EQUITY_FOREX")
+    assert classify_and_normalize("FETH") == ("FETH", "EQUITY_FOREX")
+    assert classify_and_normalize("ABNB") == ("ABNB", "EQUITY_FOREX")
+    assert classify_and_normalize("XBI") == ("XBI", "EQUITY_FOREX")
+    assert classify_and_normalize("BIST:LINK") == ("LINK.IS", "EQUITY_FOREX")
+    assert classify_and_normalize("BIST:THYAO.IS") == ("THYAO.IS", "EQUITY_FOREX")
+    assert classify_and_normalize("BINANCE:BTC") == ("BTCUSDT", "CRYPTO")
+    assert classify_and_normalize("ETHBTC") == ("ETHBTC", "CRYPTO")
+    assert classify_and_normalize("DOGEBTC") == ("DOGEBTC", "CRYPTO")

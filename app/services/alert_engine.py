@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from typing import Callable, Coroutine, List, Optional, Tuple, Union
+import math
+from typing import Callable, Coroutine, List, Optional, Set, Tuple, Union
 from app.config import Settings
 from app.database.db import AlertDatabase, AlertRecord
 from app.market_data.feed import UnifiedPriceFeed
@@ -19,10 +20,13 @@ def parse_target_price_input(
 
     Returns (calculated_target_price, auto_note_suffix) or (None, error_message).
     """
+    if isinstance(target_input, bool):
+        return None, "Hedef fiyat 0'dan büyük geçerli bir sayı olmalıdır."
+
     if isinstance(target_input, (int, float)):
         val = float(target_input)
-        if val <= 0:
-            return None, "Hedef fiyat 0'dan büyük pozitif bir sayı olmalıdır."
+        if not math.isfinite(val) or val <= 0:
+            return None, "Hedef fiyat 0'dan büyük sonlu ve pozitif bir sayı olmalıdır."
         return val, None
 
     clean = str(target_input).strip()
@@ -40,10 +44,12 @@ def parse_target_price_input(
     if clean.endswith("%"):
         try:
             pct = float(clean[:-1].strip().replace(",", "."))
+            if not math.isfinite(pct):
+                return None, f"Geçersiz yüzde formatı: '{target_input}'. Örnek: +5% veya -3%"
             if pct == 0:
                 return None, "Yüzdesel hedef değişim %0 olamaz."
             calc = current_price * (1.0 + (pct / 100.0))
-            if calc <= 0:
+            if not math.isfinite(calc) or calc <= 0:
                 return None, "Hesaplanan hedef fiyat 0 veya altına düştü."
             return calc, f"({pct:+g}% hedefi)"
         except ValueError:
@@ -61,8 +67,8 @@ def parse_target_price_input(
     clean = clean.replace(" ", "").replace(",", ".")
     try:
         val = float(clean) * multiplier
-        if val <= 0:
-            return None, "Hedef fiyat 0'dan büyük pozitif bir sayı olmalıdır."
+        if not math.isfinite(val) or val <= 0:
+            return None, "Hedef fiyat 0'dan büyük sonlu ve pozitif bir sayı olmalıdır."
         return val, None
     except ValueError:
         return None, f"Geçersiz fiyat formatı: '{target_input}'. Örnekler: 70000, 150.5, +5%, -3%, 70k"
@@ -84,10 +90,85 @@ class AutonomousAlertEngine:
         self.trigger_callback = trigger_callback
         self._running = False
         self._expiry_task: Optional[asyncio.Task] = None
+        self._active_symbols: Optional[Set[str]] = None
+        self._create_lock: Optional[asyncio.Lock] = None
+        self._create_lock_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._hook_db_mutations()
 
         # Wire price feed to evaluate alerts
         self.feed.add_listener(self._on_price_tick)
         self.feed.set_active_equity_supplier(self._get_active_non_crypto_symbols)
+
+    def _get_create_lock(self) -> asyncio.Lock:
+        """Return an asyncio.Lock bound to the active event loop for atomic quota+insert."""
+        loop = asyncio.get_running_loop()
+        if self._create_lock is None or self._create_lock_loop is not loop:
+            self._create_lock = asyncio.Lock()
+            self._create_lock_loop = loop
+        return self._create_lock
+
+    async def _refresh_active_symbols(self) -> Set[str]:
+        """Synchronize the in-memory set of symbols that currently have ACTIVE alerts."""
+        active = await self.db.get_active_alerts()
+        self._active_symbols = {a.symbol.upper().strip() for a in active}
+        return self._active_symbols
+
+    def _hook_db_mutations(self) -> None:
+        """Keep _active_symbols synchronized even when callers mutate self.db directly."""
+        if getattr(self.db, "_active_symbol_hooks_installed", False):
+            return
+
+        orig_add = self.db.add_alert
+        orig_trigger = self.db.trigger_alert
+        orig_reset = self.db.reset_alert_to_active
+        orig_cancel = self.db.cancel_alert
+        orig_clear = self.db.clear_user_alerts
+        orig_expire = self.db.expire_stale_alerts
+
+        async def _wrapped_add(*args, **kwargs):
+            alert_id = await orig_add(*args, **kwargs)
+            symbol = kwargs.get("symbol") if "symbol" in kwargs else (args[4] if len(args) > 4 else None)
+            if symbol is not None and self._active_symbols is not None:
+                self._active_symbols.add(str(symbol).upper().strip())
+            return alert_id
+
+        async def _wrapped_trigger(*args, **kwargs):
+            res = await orig_trigger(*args, **kwargs)
+            if res and self._active_symbols is not None:
+                await self._refresh_active_symbols()
+            return res
+
+        async def _wrapped_reset(*args, **kwargs):
+            res = await orig_reset(*args, **kwargs)
+            if res and self._active_symbols is not None:
+                await self._refresh_active_symbols()
+            return res
+
+        async def _wrapped_cancel(*args, **kwargs):
+            res = await orig_cancel(*args, **kwargs)
+            if res and self._active_symbols is not None:
+                await self._refresh_active_symbols()
+            return res
+
+        async def _wrapped_clear(*args, **kwargs):
+            count = await orig_clear(*args, **kwargs)
+            if count and self._active_symbols is not None:
+                await self._refresh_active_symbols()
+            return count
+
+        async def _wrapped_expire(*args, **kwargs):
+            count = await orig_expire(*args, **kwargs)
+            if count and self._active_symbols is not None:
+                await self._refresh_active_symbols()
+            return count
+
+        self.db.add_alert = _wrapped_add
+        self.db.trigger_alert = _wrapped_trigger
+        self.db.reset_alert_to_active = _wrapped_reset
+        self.db.cancel_alert = _wrapped_cancel
+        self.db.clear_user_alerts = _wrapped_clear
+        self.db.expire_stale_alerts = _wrapped_expire
+        setattr(self.db, "_active_symbol_hooks_installed", True)
 
     async def _get_active_non_crypto_symbols(self) -> List[str]:
         """Fetch all active non-crypto symbols currently registered in database alerts and watchlists."""
@@ -96,9 +177,30 @@ class AutonomousAlertEngine:
         watchlist_symbols = await self.db.get_all_watchlist_symbols(asset_type="EQUITY_FOREX")
         return list(set(alert_symbols + watchlist_symbols))
 
+    def _is_callback_ready(self) -> bool:
+        """Return True only when a trigger callback is registered and its owner (if any) is ready."""
+        if self.trigger_callback is None:
+            return False
+        cb_owner = getattr(self.trigger_callback, "__self__", None)
+        if cb_owner is not None:
+            is_closed = getattr(cb_owner, "is_closed", None)
+            if callable(is_closed) and is_closed():
+                return False
+            is_ready = getattr(cb_owner, "is_ready", None)
+            if callable(is_ready) and not is_ready():
+                return False
+        return True
+
     async def _on_price_tick(self, symbol: str, current_price: float) -> None:
         """Evaluate active alerts when a price tick arrives."""
-        active_alerts = await self.db.get_active_alerts(symbol=symbol)
+        if not self._is_callback_ready():
+            return
+        norm_symbol = symbol.upper().strip()
+        if self._active_symbols is None:
+            await self._refresh_active_symbols()
+        if norm_symbol not in self._active_symbols:
+            return
+        active_alerts = await self.db.get_active_alerts(symbol=norm_symbol)
         if not active_alerts:
             return
 
@@ -171,7 +273,7 @@ class AutonomousAlertEngine:
 
         # 4. Retrieve current market price
         current_price = await self.feed.get_current_price(symbol)
-        if current_price is None:
+        if current_price is None or not math.isfinite(current_price) or current_price <= 0:
             return (
                 False,
                 f"**{symbol}** sembolü için anlık fiyat alınamadı. Lütfen sembol adını kontrol edin (örn: BTCUSDT, THYAO, USDTRY, GOLD, NASDAQ).",
@@ -200,20 +302,37 @@ class AutonomousAlertEngine:
                 None,
             )
 
-        # 7. Insert alert into database
-        alert_id = await self.db.add_alert(
-            user_id=user_id,
-            user_name=user_name,
-            channel_id=channel_id,
-            guild_id=guild_id,
-            symbol=symbol,
-            asset_type=asset_type,
-            target_price=calc_target,
-            initial_price=current_price,
-            direction=direction,
-            note=final_note,
-            notify_dm=notify_dm,
-        )
+        # 7. Atomically re-verify quotas and insert alert under lock to eliminate TOCTOU races
+        async with self._get_create_lock():
+            total_active = await self.db.count_active_alerts()
+            if total_active >= self.settings.MAX_ACTIVE_ALERTS:
+                return (
+                    False,
+                    f"Sistem genel alarm kotası dolu! (Aktif: {total_active}/{self.settings.MAX_ACTIVE_ALERTS}). Lütfen eski alarmları temizleyin.",
+                    None,
+                )
+
+            user_active = await self.db.count_active_alerts(user_id=user_id)
+            if user_active >= self.settings.MAX_USER_ACTIVE_ALERTS:
+                return (
+                    False,
+                    f"Kişisel aktif alarm limitinize ({user_active}/{self.settings.MAX_USER_ACTIVE_ALERTS}) ulaştınız! Lütfen `/alert list` veya `/alert clear` ile eski alarmları temizleyin.",
+                    None,
+                )
+
+            alert_id = await self.db.add_alert(
+                user_id=user_id,
+                user_name=user_name,
+                channel_id=channel_id,
+                guild_id=guild_id,
+                symbol=symbol,
+                asset_type=asset_type,
+                target_price=calc_target,
+                initial_price=current_price,
+                direction=direction,
+                note=final_note,
+                notify_dm=notify_dm,
+            )
 
         record = await self.db.get_alert_by_id(alert_id)
         return True, "Alarm başarıyla oluşturuldu.", record
@@ -224,6 +343,7 @@ class AutonomousAlertEngine:
             return
         self._running = True
         await self.db.init_db()
+        await self._refresh_active_symbols()
         self.feed.start()
         self._expiry_task = asyncio.create_task(self._expiry_worker(), name="alert_expiry_cleaner")
         logger.info("AutonomousAlertEngine started.")

@@ -462,9 +462,28 @@ def classify_and_normalize(raw_symbol: str) -> Tuple[str, str]:
     """
     clean = raw_symbol.strip().upper()
 
-    # Strip prefixes like BINANCE: or BIST: or TV:
+    # Preserve explicit exchange prefixes like BINANCE: or BIST: or NASDAQ:
+    exchange_prefix = ""
     if ":" in clean:
-        _, clean = clean.split(":", 1)
+        exchange_prefix, clean = clean.split(":", 1)
+        exchange_prefix = exchange_prefix.strip()
+        clean = clean.strip()
+
+    # 0. Honor explicit exchange prefixes before heuristic rules
+    if exchange_prefix == "BIST":
+        if clean in INDEX_MAP:
+            return INDEX_MAP[clean], "EQUITY_FOREX"
+        if clean.endswith(".IS"):
+            return clean, "EQUITY_FOREX"
+        return f"{clean}.IS", "EQUITY_FOREX"
+
+    if exchange_prefix in ("BINANCE", "BINANCEUS", "BYBIT", "OKX", "KUCOIN", "COINBASE", "KRAKEN"):
+        if clean in CRYPTO_SHORTHAND:
+            return CRYPTO_SHORTHAND[clean], "CRYPTO"
+        return clean, "CRYPTO"
+
+    if exchange_prefix in ("NASDAQ", "NYSE", "AMEX", "ARCA", "BATS"):
+        return clean, "EQUITY_FOREX"
 
     # 1. Check Major Indices (NASDAQ, XU100, BIST100, SP500, DXY, etc.)
     if clean in INDEX_MAP:
@@ -484,17 +503,24 @@ def classify_and_normalize(raw_symbol: str) -> Tuple[str, str]:
     if clean.endswith("=X"):
         return clean, "EQUITY_FOREX"
 
-    # 5. Check BIST symbols or Turkish index prefixes
+    # 5. Check BIST symbols (known BIST indices are already handled in INDEX_MAP)
     if clean.endswith(".IS"):
         return clean, "EQUITY_FOREX"
-    if clean.startswith("XU") or clean.startswith("XB") or clean in BIST_POPULAR:
+    if clean in BIST_POPULAR:
         return f"{clean}.IS", "EQUITY_FOREX"
 
-    # 6. Check Crypto patterns (e.g. BTCUSDT, ETHUSDT, SOLFDUSD, DOGEBTC)
-    crypto_quote_currencies = ("USDT", "FDUSD", "USDC", "BTC", "ETH", "BNB")
-    for quote in crypto_quote_currencies:
+    # 6. Check Crypto patterns (e.g. BTCUSDT, ETHUSDT, SOLFDUSD, ETHBTC, DOGEBTC)
+    # Stablecoin quote pairs (4+ char suffix): safe to match any non-empty base
+    for quote in ("USDT", "FDUSD", "USDC"):
         if clean.endswith(quote) and len(clean) > len(quote):
             return clean, "CRYPTO"
+
+    # 3-letter crypto quote pairs (BTC, ETH, BNB): require base length >= 2 (avoids 4-letter US ETFs/equities like GBTC, FBTC, FETH, ABNB)
+    for quote in ("BTC", "ETH", "BNB"):
+        if clean.endswith(quote) and len(clean) >= len(quote) + 2:
+            base = clean[: -len(quote)]
+            if base in CRYPTO_SHORTHAND or len(base) >= 3:
+                return clean, "CRYPTO"
 
     # 7. Check if it ends with .F, =F (futures) or index ^
     if clean.endswith("=F") or clean.startswith("^"):

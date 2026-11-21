@@ -1,3 +1,4 @@
+import hmac
 import logging
 from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
@@ -9,6 +10,41 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Webhook"])
 
 
+INSECURE_DEFAULT_SECRETS = frozenset({
+    "change_me_in_production",
+    "your_super_secret_token_here",
+    "buraya_guclu_bir_sifre_veya_token",
+})
+
+MAX_WEBHOOK_BODY_BYTES = 64 * 1024  # 64 KiB hard cap
+
+
+async def _read_bounded_body(request: Request, max_bytes: int = MAX_WEBHOOK_BODY_BYTES) -> bytes:
+    """Read request body up to max_bytes, raising HTTP 413 before buffering oversized payloads."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail=f"Payload too large. Maximum allowed webhook body size is {max_bytes} bytes.",
+                )
+        except ValueError:
+            pass
+
+    chunks = []
+    total_bytes = 0
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail=f"Payload too large. Maximum allowed webhook body size is {max_bytes} bytes.",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _verify_secret(
     configured_secret: str,
     path_secret: Optional[str] = None,
@@ -16,18 +52,25 @@ def _verify_secret(
     header_secret: Optional[str] = None,
     payload_passphrase: Optional[str] = None,
 ) -> bool:
-    """Validate incoming secret against configured WEBHOOK_SECRET."""
-    # If no secret configured or default disabled, allow (with warning)
-    if not configured_secret or configured_secret == "change_me_in_production":
-        return True
+    """Validate incoming secret against configured WEBHOOK_SECRET (fail-closed)."""
+    expected = (configured_secret or "").strip()
+    if not expected or expected.lower() in INSECURE_DEFAULT_SECRETS:
+        logger.warning("Webhook authentication rejected: WEBHOOK_SECRET is empty or set to an insecure placeholder.")
+        return False
 
+    expected_bytes = expected.encode("utf-8")
     candidates = [
         path_secret,
         query_secret,
         header_secret,
         payload_passphrase,
     ]
-    return any(c is not None and c.strip() == configured_secret for c in candidates)
+    matched = False
+    for candidate in candidates:
+        if candidate is not None:
+            candidate_bytes = candidate.strip().encode("utf-8")
+            matched |= hmac.compare_digest(candidate_bytes, expected_bytes)
+    return matched
 
 
 @router.post("/webhook", status_code=status.HTTP_202_ACCEPTED)
@@ -41,7 +84,18 @@ async def receive_webhook(
     Authenticates via query param (?secret=...), header (X-Webhook-Secret), or JSON passphrase.
     """
     settings = get_settings()
-    raw_bytes = await request.body()
+    if (secret is not None or x_webhook_secret is not None) and not _verify_secret(
+        configured_secret=settings.WEBHOOK_SECRET,
+        query_secret=secret,
+        header_secret=x_webhook_secret,
+    ):
+        logger.warning("Rejected unauthenticated webhook request from %s", request.client.host if request.client else "unknown")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Invalid or missing webhook passphrase/secret.",
+        )
+
+    raw_bytes = await _read_bounded_body(request)
     alert: AlertPayload = parse_tradingview_payload(raw_bytes)
 
     if not _verify_secret(
@@ -85,19 +139,18 @@ async def receive_webhook_with_token(
     https://your-domain.com/webhook/your_super_secret_token
     """
     settings = get_settings()
-    raw_bytes = await request.body()
-    alert: AlertPayload = parse_tradingview_payload(raw_bytes)
-
     if not _verify_secret(
         configured_secret=settings.WEBHOOK_SECRET,
         path_secret=secret_token,
-        payload_passphrase=alert.passphrase,
     ):
         logger.warning("Rejected unauthenticated webhook URL token from %s", request.client.host if request.client else "unknown")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized: Invalid secret token in webhook URL path.",
         )
+
+    raw_bytes = await _read_bounded_body(request)
+    alert: AlertPayload = parse_tradingview_payload(raw_bytes)
 
     queue_service = getattr(request.app.state, "queue_service", None)
     if queue_service:

@@ -172,3 +172,29 @@ async def test_get_all_watchlist_symbols(temp_db: AlertDatabase):
     assert "THYAO.IS" in all_equities
     assert "GOLD" in all_equities
     assert "BTCUSDT" not in all_equities
+
+
+@pytest.mark.asyncio
+async def test_expire_stale_alerts(temp_db: AlertDatabase):
+    """TEST-COVERAGE-003: expire_stale_alerts expires old ACTIVE alerts while preserving recent and triggered alerts."""
+    from datetime import datetime, timezone, timedelta
+    import aiosqlite
+
+    old_id = await temp_db.add_alert(
+        user_id="u1", user_name="U1", channel_id="c1", guild_id=None,
+        symbol="BTCUSDT", asset_type="CRYPTO", target_price=70000, initial_price=65000, direction="ABOVE",
+    )
+    fresh_id = await temp_db.add_alert(
+        user_id="u1", user_name="U1", channel_id="c1", guild_id=None,
+        symbol="ETHUSDT", asset_type="CRYPTO", target_price=4000, initial_price=3500, direction="ABOVE",
+    )
+
+    old_date = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    async with aiosqlite.connect(temp_db.db_path) as conn:
+        await conn.execute("UPDATE alerts SET created_at = ? WHERE id = ?;", (old_date, old_id))
+        await conn.commit()
+
+    expired_count = await temp_db.expire_stale_alerts(max_age_days=180)
+    assert expired_count == 1
+    assert (await temp_db.get_alert_by_id(old_id)).status == "EXPIRED"
+    assert (await temp_db.get_alert_by_id(fresh_id)).status == "ACTIVE"

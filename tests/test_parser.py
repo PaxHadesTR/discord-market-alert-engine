@@ -112,3 +112,27 @@ def test_parse_comma_decimal_and_currency_symbols():
     alert_text = parse_tradingview_payload(raw_text)
     assert alert_text.ticker == "BTCUSDT"
     assert alert_text.price == 68000.50
+
+
+def test_parse_plain_text_thousands_and_european_formats():
+    """LOGIC-PARSER-006: Plain-text and JSON parsers handle US/EU thousands separators without truncation."""
+    a1 = parse_tradingview_payload("BTCUSDT BUY 68,500.25 Breakout")
+    assert a1.ticker == "BTCUSDT"
+    assert a1.price == 68500.25
+    assert a1.message == "Breakout"
+
+    a2 = parse_tradingview_payload("BTCUSDT BUY 68000,50 Breakout")
+    assert a2.price == 68000.50
+
+    a3 = parse_tradingview_payload("BTCUSDT BUY 68.500,25 Breakout")
+    assert a3.price == 68500.25
+    assert a3.message == "Breakout"
+
+    a4 = parse_tradingview_payload("BTCUSDT BUY 1,234,567")
+    assert a4.price == 1234567.0
+
+    a5 = parse_tradingview_payload('{"ticker": "BTCUSDT", "action": "BUY", "price": "68.500,25"}')
+    assert a5.price == 68500.25
+
+    a6 = parse_tradingview_payload("XRPUSDT BUY 0,525 Small decimal")
+    assert a6.price == 0.525

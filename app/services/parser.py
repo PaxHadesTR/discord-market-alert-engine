@@ -64,6 +64,32 @@ def parse_tradingview_payload(raw_body: Union[str, bytes, dict]) -> AlertPayload
     )
 
 
+def _parse_price_string(raw: str) -> Optional[float]:
+    """Parse US or European/Turkish formatted numeric strings (e.g., 68,500.25, 68.500,25, 68000,50, 1,234,567)."""
+    s = re.sub(r"[^\d\.,\-]", "", str(raw).strip())
+    if not s or s == "-":
+        return None
+    try:
+        if "," in s and "." in s:
+            if s.rfind(",") > s.rfind("."):
+                # European/Turkish format: 68.500,25
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                # US format: 68,500.25
+                s = s.replace(",", "")
+        elif "," in s:
+            if s.count(",") > 1 or re.fullmatch(r"-?[1-9]\d{0,2},\d{3}", s):
+                # Thousands grouping: 1,234,567 or 68,500 (never 0,xxx or 68000,50)
+                s = s.replace(",", "")
+            else:
+                s = s.replace(",", ".")
+        elif s.count(".") > 1:
+            s = s.replace(".", "")
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
 def _from_dict(data: Dict[str, Any]) -> AlertPayload:
     """Normalize dictionary mapping common TradingView aliases to standard AlertPayload fields."""
     # Field Aliases
@@ -94,16 +120,7 @@ def _from_dict(data: Dict[str, Any]) -> AlertPayload:
         if isinstance(price_val, (int, float)):
             price = float(price_val)
         else:
-            try:
-                s = str(price_val).strip()
-                s = re.sub(r"[^\d\.,\-]", "", s)
-                if "," in s and "." in s:
-                    s = s.replace(",", "")
-                elif "," in s and "." not in s:
-                    s = s.replace(",", ".")
-                price = float(s)
-            except (ValueError, TypeError):
-                price = None
+            price = _parse_price_string(str(price_val))
 
     strategy = (
         data.get("strategy")
@@ -174,7 +191,7 @@ def _extract_key_values(text: str) -> Dict[str, Any]:
 def _extract_tokens_from_plain_text(text: str) -> Optional[AlertPayload]:
     """Extract standard pattern like `BTCUSDT BUY 65000` or `ETH/USD SELL @ 3400,20`."""
     pattern = re.compile(
-        r"^([A-Z0-9_\-\.\/]{2,15})\s+(BUY|SELL|LONG|SHORT|CLOSE|ALERT)\b(?:\s+(?:@\s*)?([0-9]+(?:[\.,][0-9]+)?))?(.*)$",
+        r"^([A-Z0-9_\-\.\/]{2,15})\s+(BUY|SELL|LONG|SHORT|CLOSE|ALERT)\b(?:\s+(?:@\s*)?([0-9]+(?:[\.,][0-9]+)*))?(.*)$",
         re.IGNORECASE,
     )
     match = pattern.match(text)
@@ -184,12 +201,7 @@ def _extract_tokens_from_plain_text(text: str) -> Optional[AlertPayload]:
     ticker = match.group(1).upper()
     action = match.group(2).upper()
     price_str = match.group(3)
-    price: Optional[float] = None
-    if price_str:
-        try:
-            price = float(price_str.replace(",", "."))
-        except ValueError:
-            price = None
+    price: Optional[float] = _parse_price_string(price_str) if price_str else None
     remaining_msg = match.group(4).strip() if match.group(4) else None
 
     return AlertPayload(

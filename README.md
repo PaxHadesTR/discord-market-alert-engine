@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-50%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-103%20passed-brightgreen.svg)](tests/)
 
 A high-performance, self-hosted, autonomous price monitoring and notification service designed to bypass TradingView free-tier alert limits and provide institutional-grade alerts on your own infrastructure.
 
@@ -156,11 +156,10 @@ TradingView grafik veya Pine Script stratejilerinizden botunuza sinyal gönderme
 
 ### 1. Discord Bot Token Alma
 1. [Discord Developer Portal](https://discord.com/developers/applications) adresine gidin.
-2. **New Application** -> **Bot** sekmesine geçin.
-3. **Privileged Gateway Intents** altında **Message Content Intent** seçeneğini açın.
-4. **Reset Token** butonuna basarak bot tokeninizi kopyalayın (`DISCORD_BOT_TOKEN`).
-5. **OAuth2 -> URL Generator** kısmında `bot` ve `applications.commands` seçin. İzin olarak `Send Messages`, `Embed Links`, `Attach Files`, `Read Message History` verin.
-6. Üretilen davet linkiyle botu sunucunuza ekleyin.
+2. **New Application** -> **Bot** sekmesine geçin *(Bot yalnızca Slash Komutları ve `discord.Intents.default()` ile çalıştığından herhangi bir Privileged Gateway Intent açmanız gerekmez)*.
+3. **Reset Token** butonuna basarak bot tokeninizi kopyalayın (`DISCORD_BOT_TOKEN`).
+4. **OAuth2 -> URL Generator** kısmında `bot` ve `applications.commands` seçin. İzin olarak `Send Messages`, `Embed Links`, `Attach Files`, `Read Message History` verin.
+5. Üretilen davet linkiyle botu sunucunuza ekleyin.
 
 ### 2. Coolify Ortam Değişkenleri (.env)
 Coolify üzerinde aşağıdaki değişkenleri tanımlayın:
@@ -178,7 +177,7 @@ ALERT_EXPIRY_DAYS=180
 CACHE_TTL_SECONDS=20.0
 SQLITE_DB_PATH=/app/data/alerts.db
 
-# TradingView Webhook Ayarları (İsteğe Bağlı)
+# TradingView Webhook Ayarları (Webhook uç noktası için güçlü bir değer zorunludur — fail-closed)
 WEBHOOK_SECRET=buraya_guclu_bir_sifre_veya_token
 # DISCORD_WEBHOOK_URL boş bırakılırsa, TradingView sinyalleri bot üzerinden DISCORD_ALERT_CHANNEL_ID'ye gönderilir!
 ```
@@ -194,9 +193,9 @@ python -m pytest tests -v
 ```
 
 ```text
-======================== 50 passed, 1 warning in 1.43s ========================
+======================== 103 passed ========================
 ```
-Authentication, dual parser, token bucket rate limiter, SQLite işlemleri, watchlist, DM bildirimleri, yüzdesel alarmlar, cache tazeliği, sembol sınıflandırması ve tetikleyici motoru dahil **50 testin tamamı %100 yeşildir**.
+Authentication, dual parser, token bucket rate limiter, SQLite işlemleri, watchlist, DM bildirimleri, yüzdesel alarmlar, cache tazeliği, sembol sınıflandırması, piyasa beslemeleri (Binance/Yahoo), bot komutları ve tetikleyici motoru dahil **103 testin tamamı %100 yeşildir**.
 
 ---
 

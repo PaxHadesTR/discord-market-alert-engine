@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import math
+import re
 import time
 from datetime import datetime
 from typing import List, Optional
@@ -10,9 +12,19 @@ from discord.ext import commands
 from app.config import Settings
 from app.database.db import AlertRecord
 from app.market_data.symbols import classify_and_normalize, get_symbol_autocomplete
+from app.market_data.yahoo import is_valid_yahoo_symbol
 from app.services.alert_engine import AutonomousAlertEngine
 
 logger = logging.getLogger(__name__)
+
+MAX_WATCHLIST_ITEMS = 25
+WATCHLIST_FETCH_CONCURRENCY = 8
+
+
+def _sanitize_mentions(text: str) -> str:
+    """Escape @everyone/@here as well as raw <@user>/<@&role> mention syntax."""
+    escaped = discord.utils.escape_mentions(str(text))
+    return escaped.replace("<@", "<\u200b@")
 
 
 def format_price(price: Optional[float]) -> str:
@@ -60,6 +72,7 @@ async def safe_followup_send(
     **kwargs,
 ) -> Optional[discord.WebhookMessage]:
     """Safely send followup message with retry on transient proxy errors."""
+    kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
     for attempt in range(1, max_retries + 1):
         try:
             return await interaction.followup.send(**kwargs)
@@ -183,23 +196,132 @@ class AlertListView(discord.ui.View):
             self.add_item(AlertDeleteDropdown(engine, active_alerts, user_id))
 
 
+class RearmAlertButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"btn_rearm:(?P<id>[0-9]+)",
+):
+    """Stateless persistent button that resolves AlertRecord from SQLite across bot restarts."""
+
+    def __init__(self, alert_id: int) -> None:
+        self.alert_id = alert_id
+        super().__init__(
+            discord.ui.Button(
+                label="🔄 Yeniden Kur",
+                style=discord.ButtonStyle.green,
+                custom_id=f"btn_rearm:{alert_id}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Button,
+        match: re.Match[str],
+    ) -> "RearmAlertButton":
+        return cls(int(match["id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        engine: Optional[AutonomousAlertEngine] = getattr(view, "engine", None) or getattr(
+            interaction.client, "engine", None
+        )
+        alert: Optional[AlertRecord] = getattr(view, "alert", None)
+        if alert is None and engine is not None:
+            alert = await engine.db.get_alert_by_id(self.alert_id)
+        if engine is None or alert is None:
+            await interaction.response.send_message(
+                "ℹ️ Bu alarm kaydı artık bulunamadı (silinmiş veya temizlenmiş olabilir).",
+                ephemeral=True,
+            )
+            return
+        if str(interaction.user.id) != str(alert.user_id):
+            await interaction.response.send_message(
+                "❌ Bu alarm sadece sahibi tarafından yönetilebilir.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(RearmAlertModal(engine, alert))
+
+
+class DismissAlertButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"btn_dismiss:(?P<id>[0-9]+)",
+):
+    """Stateless persistent dismiss button working even after bot restarts."""
+
+    def __init__(self, alert_id: int) -> None:
+        self.alert_id = alert_id
+        super().__init__(
+            discord.ui.Button(
+                label="🗑 Kapat",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"btn_dismiss:{alert_id}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Button,
+        match: re.Match[str],
+    ) -> "DismissAlertButton":
+        return cls(int(match["id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        engine: Optional[AutonomousAlertEngine] = getattr(view, "engine", None) or getattr(
+            interaction.client, "engine", None
+        )
+        alert: Optional[AlertRecord] = getattr(view, "alert", None)
+        if alert is None and engine is not None:
+            alert = await engine.db.get_alert_by_id(self.alert_id)
+        if alert is not None and str(interaction.user.id) != str(alert.user_id):
+            await interaction.response.send_message(
+                "❌ Bu alarm sadece sahibi tarafından yönetilebilir.",
+                ephemeral=True,
+            )
+            return
+
+        if view is not None:
+            for child in view.children:
+                if hasattr(child, "disabled"):
+                    child.disabled = True
+            await interaction.response.edit_message(view=view)
+            view.stop()
+        else:
+            disabled_view = discord.ui.View(timeout=0)
+            disabled_view.add_item(
+                discord.ui.Button(
+                    label="🔄 Yeniden Kur",
+                    style=discord.ButtonStyle.green,
+                    custom_id=f"btn_rearm:{self.alert_id}",
+                    disabled=True,
+                )
+            )
+            disabled_view.add_item(
+                discord.ui.Button(
+                    label="🗑 Kapat",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"btn_dismiss:{self.alert_id}",
+                    disabled=True,
+                )
+            )
+            await interaction.response.edit_message(view=disabled_view)
+
+
 class AlertActionView(discord.ui.View):
     """Interactive Discord buttons attached to triggered alert messages."""
 
     def __init__(self, engine: AutonomousAlertEngine, alert: AlertRecord):
-        super().__init__(timeout=None)
+        super().__init__(timeout=3600)
         self.engine = engine
         self.alert = alert
-
-    @discord.ui.button(label="🔄 Yeniden Kur", style=discord.ButtonStyle.green, custom_id="btn_rearm")
-    async def rearm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RearmAlertModal(self.engine, self.alert))
-
-    @discord.ui.button(label="🗑 Kapat", style=discord.ButtonStyle.secondary, custom_id="btn_dismiss")
-    async def dismiss_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(view=self)
+        self.rearm_button = RearmAlertButton(alert.id)
+        self.dismiss_button = DismissAlertButton(alert.id)
+        self.add_item(self.rearm_button)
+        self.add_item(self.dismiss_button)
 
 
 class HelpCategorySelect(discord.ui.Select):
@@ -374,7 +496,12 @@ class DiscordAlertBot(commands.Bot):
     def __init__(self, engine: AutonomousAlertEngine, settings: Settings):
         intents = discord.Intents.default()
         proxy_url = (settings.DISCORD_PROXY or "").strip() or None
-        super().__init__(command_prefix="!", intents=intents, proxy=proxy_url)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            proxy=proxy_url,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         self.engine = engine
         self.settings = settings
         self.start_time = time.time()
@@ -385,8 +512,9 @@ class DiscordAlertBot(commands.Bot):
             logger.info("Discord Bot configured with outbound proxy: %s", proxy_url)
 
     async def setup_hook(self) -> None:
-        """Register slash command groups and sync tree."""
+        """Register persistent dynamic items, slash command groups, and sync tree."""
         global _commands_synced_globally
+        self.add_dynamic_items(RearmAlertButton, DismissAlertButton)
         self._register_commands()
         self._setup_error_handler()
         if not _commands_synced_globally:
@@ -494,12 +622,21 @@ class DiscordAlertBot(commands.Bot):
             )
 
             if not success or not record:
-                await safe_followup_send(interaction, content=f"❌ {msg}")
+                safe_msg = _sanitize_mentions(msg)
+                await safe_followup_send(
+                    interaction,
+                    content=f"❌ {safe_msg}",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 return
 
             direction_tr = "🟢 Yükseliş Kırılımı (ABOVE)" if record.direction == "ABOVE" else "🔴 Düşüş Kırılımı (BELOW)"
             dm_badge = " • 📬 DM Bildirimi Aktif" if record.notify_dm else ""
-            pct_distance = ((record.target_price - record.initial_price) / record.initial_price) * 100
+            if record.initial_price > 0 and math.isfinite(record.initial_price):
+                pct_distance = ((record.target_price - record.initial_price) / record.initial_price) * 100
+                target_field_val = f"`{format_price(record.target_price)}` (`{pct_distance:+.2f}%`)"
+            else:
+                target_field_val = f"`{format_price(record.target_price)}`"
 
             embed = discord.Embed(
                 title=f"🎯 Alarm Kuruldu: {record.symbol}",
@@ -509,7 +646,7 @@ class DiscordAlertBot(commands.Bot):
             embed.add_field(name="💵 Güncel Fiyat", value=f"`{format_price(record.initial_price)}`", inline=True)
             embed.add_field(
                 name="🎯 Hedef Fiyat",
-                value=f"`{format_price(record.target_price)}` (`{pct_distance:+.2f}%`)",
+                value=target_field_val,
                 inline=True,
             )
             embed.add_field(name="📊 Beklenen Yön", value=f"`{direction_tr}`", inline=False)
@@ -517,7 +654,12 @@ class DiscordAlertBot(commands.Bot):
                 embed.add_field(name="📝 Not", value=f"> {record.note}", inline=False)
             embed.set_footer(text=f"Alarm ID: #{record.id} • {record.asset_type}{dm_badge}")
 
-            await safe_followup_send(interaction, content=f"{interaction.user.mention}", embed=embed)
+            await safe_followup_send(
+                interaction,
+                content=f"{interaction.user.mention}",
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[interaction.user]),
+            )
 
         # --- /alert list ---
         @alert_group.command(name="list", description="Kurduğunuz alarmları listeler ve tek tıkla silme menüsü sunar")
@@ -548,7 +690,7 @@ class DiscordAlertBot(commands.Bot):
                 dm_str = " 📬" if a.notify_dm else ""
 
                 current_price = await self.engine.feed.get_current_price(a.symbol)
-                if current_price is not None and a.status == "ACTIVE":
+                if current_price is not None and math.isfinite(current_price) and current_price > 0 and a.status == "ACTIVE":
                     pct_distance = ((a.target_price - current_price) / current_price) * 100
                     dist_str = f" (Fark: `{pct_distance:+.2f}%`)"
                     price_line = f"Anlık: `{format_price(current_price)}`{dist_str} | Başlangıç: `{format_price(a.initial_price)}`"
@@ -604,7 +746,12 @@ class DiscordAlertBot(commands.Bot):
             norm_symbol, _ = classify_and_normalize(symbol)
             current_price = await self.engine.feed.get_current_price(symbol)
             if current_price is None:
-                await safe_followup_send(interaction, content=f"❌ **{symbol}** için anlık fiyat alınamadı.")
+                safe_sym = _sanitize_mentions(symbol)
+                await safe_followup_send(
+                    interaction,
+                    content=f"❌ **{safe_sym}** için anlık fiyat alınamadı.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 return
 
             display_title = symbol.upper().strip()
@@ -640,11 +787,28 @@ class DiscordAlertBot(commands.Bot):
                 timestamp=datetime.now(),
             )
 
-            for sym in symbols:
-                price = await self.engine.feed.get_current_price(sym)
+            displayed_symbols = symbols[:MAX_WATCHLIST_ITEMS]
+            semaphore = asyncio.Semaphore(WATCHLIST_FETCH_CONCURRENCY)
+
+            async def _fetch_one(sym: str) -> Optional[float]:
+                async with semaphore:
+                    return await self.engine.feed.get_current_price(sym)
+
+            results = await asyncio.gather(
+                *[_fetch_one(sym) for sym in displayed_symbols],
+                return_exceptions=True,
+            )
+
+            for sym, res in zip(displayed_symbols, results):
+                price = None if isinstance(res, Exception) else res
                 embed.add_field(name=f"🔹 {sym}", value=f"`{format_price(price)}`", inline=True)
 
-            embed.set_footer(text=f"Toplam: {len(symbols)} varlık • /watchlist")
+            if len(symbols) > MAX_WATCHLIST_ITEMS:
+                embed.set_footer(
+                    text=f"İlk {MAX_WATCHLIST_ITEMS} / {len(symbols)} varlık gösteriliyor (kısaltıldı) • /watchlist"
+                )
+            else:
+                embed.set_footer(text=f"Toplam: {len(symbols)} varlık • /watchlist")
             await safe_followup_send(interaction, embed=embed)
 
         # --- /watchlist add ---
@@ -654,6 +818,30 @@ class DiscordAlertBot(commands.Bot):
         async def watchlist_add(interaction: discord.Interaction, symbol: str):
             await safe_defer(interaction, ephemeral=True)
             norm_symbol, asset_type = classify_and_normalize(symbol)
+            if not is_valid_yahoo_symbol(norm_symbol):
+                await safe_followup_send(
+                    interaction,
+                    content="❌ Geçersiz sembol formatı. Lütfen geçerli bir sembol girin (örn: BTC, THYAO, GOLD).",
+                    ephemeral=True,
+                )
+                return
+
+            existing = await self.engine.db.get_user_watchlist(str(interaction.user.id))
+            if norm_symbol in existing:
+                await safe_followup_send(
+                    interaction,
+                    content=f"ℹ️ **{norm_symbol}** zaten takip listenizde kayıtlı.",
+                    ephemeral=True,
+                )
+                return
+            if len(existing) >= MAX_WATCHLIST_ITEMS:
+                await safe_followup_send(
+                    interaction,
+                    content=f"❌ Takip listesi limitine ({MAX_WATCHLIST_ITEMS}) ulaştınız. Yeni sembol eklemek için önce `/watchlist remove` kullanın.",
+                    ephemeral=True,
+                )
+                return
+
             success = await self.engine.db.add_to_watchlist(str(interaction.user.id), norm_symbol, asset_type)
 
             if success:
@@ -736,19 +924,23 @@ class DiscordAlertBot(commands.Bot):
 
     async def dispatch_alert_notification(self, alert: AlertRecord, current_price: float) -> bool:
         """Send rich embed notification to target channel or directly via DM. Returns True if delivered, False otherwise."""
-        if self.is_closed():
-            logger.warning("Discord Alert Bot client is closed/reconnecting. Skipping dispatch for alert #%d.", alert.id)
+        if self.is_closed() or not self.is_ready():
+            logger.warning("Discord Alert Bot client is closed or not ready. Skipping dispatch for alert #%d.", alert.id)
             return False
 
         is_bullish = alert.direction == "ABOVE"
         direction_label = "Yükseliş Kırılımı (ABOVE)" if is_bullish else "Düşüş Kırılımı (BELOW)"
         color = 0x00FF88 if is_bullish else 0xFF3366
         icon = "🚀" if is_bullish else "⚠️"
-        pct_change = ((current_price - alert.initial_price) / alert.initial_price) * 100
+        if alert.initial_price > 0 and math.isfinite(alert.initial_price):
+            pct_change = ((current_price - alert.initial_price) / alert.initial_price) * 100
+            pct_suffix = f" (`{pct_change:+.2f}%`)"
+        else:
+            pct_suffix = ""
 
         embed = discord.Embed(
             title=f"{icon} FİYAT ALARMI TETİKLENDİ: {alert.symbol}",
-            description=f"> **{alert.symbol}** hedef fiyata ulaştı! (`{pct_change:+.2f}%`)",
+            description=f"> **{alert.symbol}** hedef fiyata ulaştı!{pct_suffix}",
             color=color,
             timestamp=datetime.now(),
         )
@@ -794,9 +986,14 @@ class DiscordAlertBot(commands.Bot):
                 return False
 
         delivered = False
+        owner_mention_policy = discord.AllowedMentions(
+            everyone=False,
+            roles=False,
+            users=[discord.Object(id=int(alert.user_id))],
+        )
         for attempt in range(1, 4):
             try:
-                await channel.send(content=content, embed=embed, view=view)
+                await channel.send(content=content, embed=embed, view=view, allowed_mentions=owner_mention_policy)
                 logger.info("Successfully announced alert #%d in Discord channel %s", alert.id, target_channel_id)
                 delivered = True
                 break

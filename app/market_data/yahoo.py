@@ -1,9 +1,21 @@
 import asyncio
 import logging
+import re
 from typing import Callable, Coroutine, List, Optional
+from urllib.parse import quote as url_quote
 import httpx
 
 logger = logging.getLogger(__name__)
+
+VALID_YAHOO_SYMBOL_RE = re.compile(r"^[A-Z0-9.\-=^]{1,20}$")
+
+
+def is_valid_yahoo_symbol(symbol: str) -> bool:
+    """Validate that a normalized symbol matches strict allowlist without path traversal."""
+    cleaned = (symbol or "").upper().strip()
+    if not cleaned or ".." in cleaned:
+        return False
+    return bool(VALID_YAHOO_SYMBOL_RE.fullmatch(cleaned))
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -18,16 +30,21 @@ class YahooFinanceFeed:
         self,
         poll_interval_seconds: float = 20.0,
         timeout_seconds: float = 8.0,
+        max_concurrent_requests: int = 8,
     ) -> None:
         self.poll_interval = poll_interval_seconds
         self.timeout = timeout_seconds
+        self.max_concurrent_requests = max(1, max_concurrent_requests)
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._client: Optional[httpx.AsyncClient] = None
 
     async def fetch_price(self, symbol: str) -> Optional[float]:
         """Fetch latest price snapshot for non-crypto symbols (BIST, US Equities, Forex, Gold)."""
-        symbol_clean = symbol.upper().strip()
+        symbol_clean = (symbol or "").upper().strip()
+        if not is_valid_yahoo_symbol(symbol_clean):
+            logger.warning("Rejected invalid Yahoo Finance symbol: %r", symbol)
+            return None
         price = await self._fetch_direct_price(symbol_clean)
         if price is not None:
             return price
@@ -49,7 +66,12 @@ class YahooFinanceFeed:
         return self._client
 
     async def _fetch_direct_price(self, symbol_clean: str) -> Optional[float]:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol_clean}"
+        if not is_valid_yahoo_symbol(symbol_clean):
+            logger.warning("Blocked malformed Yahoo Finance symbol in _fetch_direct_price: %r", symbol_clean)
+            return None
+
+        encoded_symbol = url_quote(symbol_clean, safe="=^.-")
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
         params = {"interval": "1m", "range": "1d"}
 
         try:
@@ -86,7 +108,8 @@ class YahooFinanceFeed:
         if self._running:
             return
         self._running = True
-        self._client = httpx.AsyncClient(headers=HEADERS, timeout=self.timeout)
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(headers=HEADERS, timeout=self.timeout)
         self._task = asyncio.create_task(
             self._poll_loop(get_active_symbols, on_price_update),
             name="yahoo_finance_poller",
@@ -113,12 +136,18 @@ class YahooFinanceFeed:
         get_active_symbols: Callable[[], Coroutine[None, None, List[str]]],
         on_price_update: Callable[[str, float], Coroutine[None, None, None]],
     ) -> None:
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+
+        async def _bounded_poll(symbol: str) -> None:
+            async with semaphore:
+                await self._poll_symbol(symbol, on_price_update)
+
         while self._running:
             try:
                 symbols = await get_active_symbols()
                 if symbols:
                     logger.debug("Polling Yahoo Finance for %d active symbols: %s", len(symbols), symbols)
-                    tasks = [self._poll_symbol(s, on_price_update) for s in set(symbols)]
+                    tasks = [_bounded_poll(s) for s in set(symbols)]
                     await asyncio.gather(*tasks, return_exceptions=True)
 
             except asyncio.CancelledError:
