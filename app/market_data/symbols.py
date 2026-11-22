@@ -1,491 +1,144 @@
+import asyncio
 import re
-from typing import Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
-# ---------------------------------------------------------------------------
-# Borsa Istanbul (BIST) Equities
-# All symbols listed here automatically get .IS appended for Yahoo Finance.
-# ---------------------------------------------------------------------------
-BIST_POPULAR = {
-    # BIST 30 & Large Caps
-    "THYAO", "ASELS", "GARAN", "EREGL", "SISE", "KCHOL", "AKBNK", "BIMAS", "TUPRS",
-    "YKBNK", "SAHOL", "FROTO", "TOASO", "PETKM", "KOZAL", "PGSUS", "TCELL", "TTKOM",
-    "ENKAI", "ARCLK", "VESTL", "HEKTS", "SASA", "GUBRF", "KOZAA", "SOKM", "MGROS",
-    "ISCTR", "VAKBN", "HALKB", "EKGYO", "ASTOR", "KONTR", "ALARK", "ODAS", "CANTE",
+from app.market_data.symbol_catalog import (
+    AUTOCOMPLETE_PRESETS,
+    BIST_ALIASES,
+    BIST_POPULAR,
+    COMMODITY_MAP,
+    CRYPTO_SHORTHAND,
+    EQUITY_ALIASES,
+    FOREX_PAIRS,
+    INDEX_MAP,
+    KNOWN_EQUITIES,
+    YAHOO_CRYPTO_MAP,
+)
 
-    # Banking & Financial Institutions
-    "ALBRK", "SKBNK", "TSKB", "QNBFB", "KLNMA", "ANSGR", "AKGRT", "TURSG", "AGESA",
-    "ISFIN", "VAKFN", "ISMEN", "OYAYO", "INFO", "GEDIK", "GLBMD", "OSMEN",
+__all__ = [
+    "AUTOCOMPLETE_PRESETS",
+    "BIST_ALIASES",
+    "BIST_POPULAR",
+    "COMMODITY_MAP",
+    "CRYPTO_SHORTHAND",
+    "EQUITY_ALIASES",
+    "FOREX_PAIRS",
+    "INDEX_MAP",
+    "KNOWN_EQUITIES",
+    "YAHOO_CRYPTO_MAP",
+    "classify_and_normalize",
+    "get_symbol_autocomplete",
+    "get_symbol_autocomplete_async",
+]
 
-    # Holdings & Conglomerates
-    "DOHOL", "AGHOL", "BERA", "GSDHO", "GLYHO", "TKFEN", "POLHO", "ALGYO", "ECZYT",
-    "GSDDE", "HUBVC", "INVEO", "VERUS",
+CRYPTO_QUOTE_CURRENCIES: Tuple[str, ...] = ("USDT", "FDUSD", "USDC", "BTC", "ETH", "BNB")
 
-    # Energy, Renewable & Electricity
-    "EUPWR", "CWENE", "ENJSA", "AKSEN", "ZOREN", "AKENR", "BIOEN", "GWIND", "YEOTK",
-    "SAYAS", "GESAN", "ALFAS", "SMRTG", "MOGAN", "ENERY", "TATEN", "KOPOL", "CVKMD",
-    "KAYSE", "ANGEN", "MAGEN", "AHGAZ", "HUNER", "CANTE", "CONSE", "AYDEM",
-
-    # Technology, Software & Defense
-    "REEDR", "MIATK", "SDTTR", "PAPIL", "ARDYZ", "VBTYZ", "FORTE", "PATEK", "BINHO",
-    "ALVES", "AGROT", "MOBTL", "INDES", "LOGO", "KFEIN", "FONET", "DESPEC", "DATAGATE",
-    "LINK", "KAREL", "NETAS", "OBAMS", "TABGD", "BIGCH",
-
-    # Industrial, Steel & Manufacturing
-    "BRSAN", "TAVHL", "CCOLA", "MAVI", "OTKAR", "KRDMD", "KRDMA", "KRDMB", "ISDMR",
-    "CEMTS", "BMSCH", "TUCLK", "KCAER", "ERBOS", "SARKY", "TMSN", "ASUZU", "KARSN",
-    "BRISA", "GOODY", "JANTS", "BFREN", "EGEEN", "VESBE", "KLMSN", "ARZUM",
-
-    # Cement, Glass & Building Materials
-    "OYAKC", "CIMSA", "AKCNS", "NUHCM", "BUCIM", "BTCIM", "QUAGR", "BOBET", "BNTAS",
-    "EGSER", "KALEK",
-
-    # Real Estate Investment Trusts (GYO)
-    "ISGYO", "VKGYO", "TRGYO", "OZKGY", "SNGYO", "KLGYO", "PEKGY", "RYGYO", "HLGYO",
-    "KGYO", "ASGYO", "SURGY", "KZBGY", "MHRGY", "AKFGY", "PSGYO", "YGYO", "DGGYO",
-
-    # Pharma, Health & Chemicals
-    "DEVA", "SELEC", "ECILC", "GENIL", "TRILC", "RTALB", "MPARK", "LKMNH", "KORDS",
-    "BAGFS", "EGGUB", "DEVA", "DYOBY",
-
-    # Food, Beverage & Agriculture
-    "ULKER", "AEFES", "TATGD", "PNSUT", "PETUN", "KERVT", "DARDL", "BANVT", "YYLGD",
-    "ULUUN", "GOKNR", "TUKAS", "FADE", "KRVGD", "KUTPO", "OYYAT", "AVOD",
-
-    # Transportation & Logistics
-    "CLEBI", "RYSAS", "REYSA", "GSDDE",
-
-    # Sports Clubs
-    "FENER", "GSRAY", "BJKAS", "TSPOR",
+# Explicit exchange prefixes that override heuristic routing
+_US_EQUITY_PREFIXES = {"NASDAQ", "NYSE", "AMEX", "ARCA", "US", "STOCK", "ETF", "BATS", "CBOE"}
+_BIST_PREFIXES = {"BIST", "IST", "BORSA"}
+_CRYPTO_PREFIXES = {"BINANCE", "BINANCEUS", "BYBIT", "OKX", "KUCOIN", "COINBASE", "KRAKEN", "CRYPTO"}
+_FOREX_PREFIXES = {"FX", "FOREX", "OANDA", "FXCM"}
+_EXCHANGE_SUFFIX_MAP: Dict[str, str] = {
+    "XETR": ".DE",
+    "FRA": ".DE",
+    "EPA": ".PA",
+    "EURONEXT": ".PA",
+    "LSE": ".L",
+    "TSE": ".T",
+    "TYO": ".T",
+    "HKEX": ".HK",
+    "AMS": ".AS",
+    "TSX": ".TO",
 }
 
-# ---------------------------------------------------------------------------
-# Forex & Currency Pairs (appends =X for Yahoo Finance)
-# ---------------------------------------------------------------------------
-FOREX_PAIRS = {
-    # Turkish Lira crosses
-    "USDTRY", "EURTRY", "GBPTRY", "CHFTRY", "CADTRY", "AUDTRY", "JPYTRY", "RUBTRY",
-    "AEDTRY", "SARTRY", "CNYTRY", "AZNTRY", "QARTRY", "KWDTRY", "NOKTRY", "SEKTRY",
+_TURKISH_TRANSLATION = str.maketrans({
+    "Ç": "C", "ç": "C",
+    "Ğ": "G", "ğ": "G",
+    "İ": "I", "ı": "I",
+    "Ö": "O", "ö": "O",
+    "Ş": "S", "ş": "S",
+    "Ü": "U", "ü": "U",
+})
 
-    # Major FX pairs
-    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
+_WORD_SPLIT_RE = re.compile(r"[^A-Z0-9]+")
 
-    # European & Asian crosses
-    "EURGBP", "EURJPY", "EURCHF", "EURAUD", "EURCAD", "EURNZD",
-    "GBPJPY", "GBPCHF", "GBPAUD", "GBPCAD", "GBPNZD",
-    "AUDJPY", "CADJPY", "CHFJPY", "NZDJPY",
-    "AUDCAD", "AUDNZD", "AUDCHF", "CADCHF", "NZDCAD", "NZDCHF",
 
-    # Emerging & Other currencies
-    "USDCNY", "USDHKD", "USDSGD", "USDINR", "USDKRW", "USDMXN", "USDBRL", "USDZAR",
-    "USDPLN", "USDSEK", "USDNOK",
-}
+def _normalize_search_text(text: str) -> str:
+    """Uppercase and fold Turkish diacritics for forgiving autocomplete matching."""
+    return text.strip().translate(_TURKISH_TRANSLATION).upper()
 
-# ---------------------------------------------------------------------------
-# Major Indices & Futures Mappings
-# ---------------------------------------------------------------------------
-INDEX_MAP = {
-    # Borsa Istanbul Indices
-    "XU100": "XU100.IS",
-    "BIST100": "XU100.IS",
-    "BIST": "XU100.IS",
-    "BORSA": "XU100.IS",
-    "XU030": "XU030.IS",
-    "BIST30": "XU030.IS",
-    "XBANK": "XBANK.IS",
-    "BISTBANKA": "XBANK.IS",
-    "XUSIN": "XUSIN.IS",
-    "BISTSINAI": "XUSIN.IS",
-    "XBLSM": "XBLSM.IS",
-    "BISTBILISIM": "XBLSM.IS",
-    "XGIDA": "XGIDA.IS",
-    "XUTEK": "XUTEK.IS",
-    "XGMYO": "XGMYO.IS",
-    "XINSA": "XINSA.IS",
-    "XELKT": "XELKT.IS",
-    "XHOLD": "XHOLD.IS",
-    "XILTM": "XILTM.IS",
-    "XSPOR": "XSPOR.IS",
-    "XKMYA": "XKMYA.IS",
-    "XTRZM": "XTRZM.IS",
 
-    # US Major Indices & Tech
-    "NASDAQ": "^NDX",
-    "NASDAQ100": "^NDX",
-    "NDX": "^NDX",
-    "NAS100": "^NDX",
-    "US100": "^NDX",
-    "USTECH100": "^NDX",
-    "USTECH": "^NDX",
-    "NQ": "NQ=F",
-    "MNQ": "MNQ=F",
-    "IXIC": "^IXIC",
-    "COMPOSITE": "^IXIC",
-    "NASDAQCOMPOSITE": "^IXIC",
-    "QQQ": "QQQ",
-    "TQQQ": "TQQQ",
-    "SQQQ": "SQQQ",
-
-    "SP500": "^GSPC",
-    "S&P500": "^GSPC",
-    "SPX": "^GSPC",
-    "US500": "^GSPC",
-    "INX": "^GSPC",
-    "ES": "ES=F",
-    "MES": "MES=F",
-    "SPY": "SPY",
-    "VOO": "VOO",
-    "IVV": "IVV",
-
-    "DOW": "^DJI",
-    "DJI": "^DJI",
-    "DOWJONES": "^DJI",
-    "US30": "^DJI",
-    "DJIA": "^DJI",
-    "YM": "YM=F",
-    "MYM": "MYM=F",
-    "DIA": "DIA",
-
-    "RUSSELL": "^RUT",
-    "RUSSELL2000": "^RUT",
-    "RUT": "^RUT",
-    "US2000": "^RUT",
-    "IWM": "IWM",
-
-    # Volatility Index
-    "VIX": "^VIX",
-    "VOLATILITY": "^VIX",
-    "KORKU": "^VIX",
-
-    # European & Global Indices
-    "DAX": "^GDAXI",
-    "DAX40": "^GDAXI",
-    "GER40": "^GDAXI",
-    "GERMANY40": "^GDAXI",
-    "FTSE": "^FTSE",
-    "UK100": "^FTSE",
-    "FTSE100": "^FTSE",
-    "CAC": "^FCHI",
-    "CAC40": "^FCHI",
-    "FRA40": "^FCHI",
-    "NIKKEI": "^N225",
-    "NIKKEI225": "^N225",
-    "N225": "^N225",
-    "JPN225": "^N225",
-    "HANGSENG": "^HSI",
-    "HSI": "^HSI",
-    "HK50": "^HSI",
-    "EUROSTOXX": "^STOXX50E",
-    "STOXX50": "^STOXX50E",
-    "SX5E": "^STOXX50E",
-    "EU50": "^STOXX50E",
-    "SHANGHAI": "000001.SS",
-    "SSEC": "000001.SS",
-    "SSE": "000001.SS",
-    "KOSPI": "^KS11",
-    "NIFTY": "^NSEI",
-    "NIFTY50": "^NSEI",
-    "SENSEX": "^BSESN",
-    "TSX": "^GSPTSE",
-    "ASX": "^AXJO",
-    "ASX200": "^AXJO",
-    "BOVESPA": "^BVSP",
-
-    # Dollar Index & US Bond Yields
-    "DXY": "DX-Y.NYB",
-    "DX-Y": "DX-Y.NYB",
-    "USDX": "DX-Y.NYB",
-    "DOLLARINDEX": "DX-Y.NYB",
-    "US10Y": "^TNX",
-    "TNX": "^TNX",
-    "10Y": "^TNX",
-    "US30Y": "^TYX",
-    "30Y": "^TYX",
-    "US05Y": "^FVX",
-    "5Y": "^FVX",
-    "US02Y": "^IRX",
-    "2Y": "^IRX",
-}
-
-# ---------------------------------------------------------------------------
-# Commodities (Futures mappings on Yahoo Finance)
-# ---------------------------------------------------------------------------
-COMMODITY_MAP = {
-    # Precious & Industrial Metals
-    "GOLD": "GC=F",
-    "ALTIN": "GC=F",
-    "ONS": "GC=F",
-    "ONSALTIN": "GC=F",
-    "XAU": "GC=F",
-    "XAUUSD": "GC=F",
-    "SILVER": "SI=F",
-    "GUMUS": "SI=F",
-    "ONSGUMUS": "SI=F",
-    "XAG": "SI=F",
-    "XAGUSD": "SI=F",
-    "PLATINUM": "PL=F",
-    "PLATIN": "PL=F",
-    "XPT": "PL=F",
-    "PALLADIUM": "PA=F",
-    "PALADYUM": "PA=F",
-    "XPD": "PA=F",
-    "COPPER": "HG=F",
-    "BAKIR": "HG=F",
-    "ALUMINUM": "ALI=F",
-    "ALUMINYUM": "ALI=F",
-
-    # Energy Commodities
-    "BRENT": "BZ=F",
-    "BRENTPETROL": "BZ=F",
-    "UKOIL": "BZ=F",
-    "CRUDE": "CL=F",
-    "OIL": "CL=F",
-    "PETROL": "CL=F",
-    "WTI": "CL=F",
-    "USOIL": "CL=F",
-    "HAM_PETROL": "CL=F",
-    "NATGAS": "NG=F",
-    "DOGALGAZ": "NG=F",
-    "GASOLINE": "RB=F",
-    "BENZIN": "RB=F",
-    "HEATINGOIL": "HO=F",
-
-    # Agriculture & Softs
-    "WHEAT": "ZW=F",
-    "BUGDAY": "ZW=F",
-    "CORN": "ZC=F",
-    "MISIR": "ZC=F",
-    "SOYBEAN": "ZS=F",
-    "SOYA": "ZS=F",
-    "COFFEE": "KC=F",
-    "KAHVE": "KC=F",
-    "SUGAR": "SB=F",
-    "SEKER": "SB=F",
-    "COTTON": "CT=F",
-    "PAMUK": "CT=F",
-    "COCOA": "CC=F",
-    "KAKAO": "CC=F",
-}
-
-# ---------------------------------------------------------------------------
-# Crypto Shorthand Aliases (mapped to *USDT on Binance)
-# ---------------------------------------------------------------------------
-CRYPTO_SHORTHAND = {
-    # Top 20 Market Cap
-    "BTC": "BTCUSDT",
-    "BITCOIN": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "ETHEREUM": "ETHUSDT",
-    "SOL": "SOLUSDT",
-    "SOLANA": "SOLUSDT",
-    "BNB": "BNBUSDT",
-    "BINANCE": "BNBUSDT",
-    "XRP": "XRPUSDT",
-    "RIPPLE": "XRPUSDT",
-    "DOGE": "DOGEUSDT",
-    "DOGECOIN": "DOGEUSDT",
-    "ADA": "ADAUSDT",
-    "CARDANO": "ADAUSDT",
-    "AVAX": "AVAXUSDT",
-    "AVALANCHE": "AVAXUSDT",
-    "SUI": "SUIUSDT",
-    "DOT": "DOTUSDT",
-    "POLKADOT": "DOTUSDT",
-    "LINK": "LINKUSDT",
-    "CHAINLINK": "LINKUSDT",
-    "TRX": "TRXUSDT",
-    "TRON": "TRXUSDT",
-    "TON": "TONUSDT",
-    "TONCOIN": "TONUSDT",
-    "SHIB": "SHIBUSDT",
-    "SHIBA": "SHIBAUSDT",
-    "NEAR": "NEARUSDT",
-    "APT": "APTUSDT",
-    "APTOS": "APTUSDT",
-    "POL": "POLUSDT",
-    "MATIC": "POLUSDT",
-    "POLYGON": "POLUSDT",
-    "LTC": "LTCUSDT",
-    "LITECOIN": "LTCUSDT",
-    "BCH": "BCHUSDT",
-    "BITCOINCASH": "BCHUSDT",
-    "UNI": "UNIUSDT",
-    "UNISWAP": "UNIUSDT",
-    "XLM": "XLMUSDT",
-    "STELLAR": "XLMUSDT",
-    "ETC": "ETCUSDT",
-    "ETHEREUMCLASSIC": "ETCUSDT",
-
-    # AI & DePIN Tokens
-    "FET": "FETUSDT",
-    "ASI": "FETUSDT",
-    "TAO": "TAOUSDT",
-    "BITTENSOR": "TAOUSDT",
-    "RENDER": "RENDERUSDT",
-    "RNDR": "RENDERUSDT",
-    "INJ": "INJUSDT",
-    "INJECTIVE": "INJUSDT",
-    "GRT": "GRTUSDT",
-    "THEGRAPH": "GRTUSDT",
-    "AR": "ARUSDT",
-    "ARWEAVE": "ARUSDT",
-    "FIL": "FILUSDT",
-    "FILECOIN": "FILUSDT",
-    "ICP": "ICPUSDT",
-    "INTERNETCOMPUTER": "ICPUSDT",
-    "IO": "IOUSDT",
-    "ATH": "ATHUSDT",
-    "AETHIR": "ATHUSDT",
-
-    # Layer 1 & Layer 2 Chains
-    "TIA": "TIAUSDT",
-    "CELESTIA": "TIAUSDT",
-    "SEI": "SEIUSDT",
-    "ARB": "ARBUSDT",
-    "ARBITRUM": "ARBUSDT",
-    "OP": "OPUSDT",
-    "OPTIMISM": "OPUSDT",
-    "STRK": "STRKUSDT",
-    "STARKNET": "STRKUSDT",
-    "HBAR": "HBARUSDT",
-    "HEDERA": "HBARUSDT",
-    "ATOM": "ATOMUSDT",
-    "COSMOS": "ATOMUSDT",
-    "STX": "STXUSDT",
-    "STACKS": "STXUSDT",
-    "IMX": "IMXUSDT",
-    "IMMUTABLE": "IMXUSDT",
-    "FTM": "FTMUSDT",
-    "FANTOM": "FTMUSDT",
-    "SONIC": "FTMUSDT",
-    "ALGO": "ALGOUSDT",
-    "ALGORAND": "ALGOUSDT",
-    "VET": "VETUSDT",
-    "VECHAIN": "VETUSDT",
-    "KAS": "KASUSDT",
-    "KASPA": "KASUSDT",
-    "EGLD": "EGLDUSDT",
-    "MULTIVERSX": "EGLDUSDT",
-    "CFX": "CFXUSDT",
-    "CONFLUX": "CFXUSDT",
-    "CKB": "CKBUSDT",
-    "NERVOS": "CKBUSDT",
-    "RON": "RONINUSDT",
-    "RONIN": "RONINUSDT",
-    "BEAM": "BEAMUSDT",
-    "ZK": "ZKUSDT",
-    "ZKSYNC": "ZKUSDT",
-
-    # DeFi & Yield
-    "AAVE": "AAVEUSDT",
-    "MKR": "MKRUSDT",
-    "MAKER": "MKRUSDT",
-    "RUNE": "RUNEUSDT",
-    "THORCHAIN": "RUNEUSDT",
-    "ONDO": "ONDOUSDT",
-    "PENDLE": "PENDLEUSDT",
-    "JUP": "JUPUSDT",
-    "JUPITER": "JUPUSDT",
-    "PYTH": "PYTHUSDT",
-    "ENA": "ENAUSDT",
-    "ETHENA": "ENAUSDT",
-    "CRV": "CRVUSDT",
-    "CURVE": "CRVUSDT",
-    "LDO": "LDOUSDT",
-    "LIDO": "LDOUSDT",
-    "DYDX": "DYDXUSDT",
-    "SNX": "SNXUSDT",
-    "1INCH": "1INCHUSDT",
-    "GMX": "GMXUSDT",
-    "CAKE": "CAKEUSDT",
-    "SUSHI": "SUSHIUSDT",
-    "COMP": "COMPUSDT",
-
-    # Meme Coins & Community Tokens
-    "PEPE": "PEPEUSDT",
-    "WIF": "WIFUSDT",
-    "DOGWIFHAT": "WIFUSDT",
-    "BONK": "BONKUSDT",
-    "FLOKI": "FLOKIUSDT",
-    "POPCAT": "POPCATUSDT",
-    "BOME": "BOMEUSDT",
-    "MEW": "MEWUSDT",
-    "NEIRO": "NEIROUSDT",
-    "TURBO": "TURBOUSDT",
-    "BABYDOGE": "1MBABYDOGEUSDT",
-    "MEME": "MEMEUSDT",
-
-    # Telegram / TON Ecosystem & Gaming
-    "NOT": "NOTUSDT",
-    "NOTCOIN": "NOTUSDT",
-    "DOGS": "DOGSUSDT",
-    "HMSTR": "HMSTRUSDT",
-    "HAMSTER": "HMSTRUSDT",
-    "CATI": "CATIUSDT",
-    "GALA": "GALAUSDT",
-    "AXS": "AXSUSDT",
-    "SAND": "SANDUSDT",
-    "MANA": "MANAUSDT",
-    "CHZ": "CHZUSDT",
-    "CHILIZ": "CHZUSDT",
-
-    # Other Notable Coins
-    "WLD": "WLDUSDT",
-    "WORLDCOIN": "WLDUSDT",
-    "JASMY": "JASMYUSDT",
-    "ORDI": "ORDIUSDT",
-    "SATS": "1000SATSUSDT",
-    "OM": "OMUSDT",
-    "MANTRA": "OMUSDT",
-    "ROSE": "ROSEUSDT",
-    "KAVA": "KAVAUSDT",
-    "ZIL": "ZILUSDT",
-    "ENJ": "ENJUSDT",
-    "BLUR": "BLURUSDT",
-    "TRB": "TRBUSDT",
-    "QNT": "QNTUSDT",
-    "XMR": "XMRUSDT",
-    "MONERO": "XMRUSDT",
-    "ZEC": "ZECUSDT",
-    "DASH": "DASHUSDT",
-    "EOS": "EOSUSDT",
-    "NEO": "NEOUSDT",
-    "IOTA": "IOTAUSDT",
-    "XTZ": "XTZUSDT",
-}
+def _truncate_choice(label: str, value: str) -> Tuple[str, str]:
+    """Enforce Discord's 100-character limit for autocomplete Choice name and value."""
+    return label[:100], value[:100]
 
 
 def classify_and_normalize(raw_symbol: str) -> Tuple[str, str]:
     """Normalize input symbol and determine whether it routes to Binance WS or Yahoo Finance.
 
-    :param raw_symbol: User inputted symbol (e.g., btcusdt, btc, NASDAQ, XU100, xau, THYAO, USDTRY)
+    Supports:
+    - Explicit exchange prefixes (e.g., BIST:LINK, NASDAQ:DASH, NYSE:AR, BINANCE:BTC, FX:EURUSD)
+    - Slash notation (e.g., BTC/USDT, USD/TRY, EUR/USD, XAU/USD)
+    - Indices, futures, bond yields, commodities (EN + TR aliases)
+    - Binance Spot cryptos + non-Binance major cryptos via Yahoo Finance
+    - Borsa Istanbul (560+ stocks + legacy rebranding aliases)
+    - US & Global equities + ETFs (including dot share classes like BRK.B -> BRK-B)
+
+    :param raw_symbol: User inputted symbol (e.g., btcusdt, btc, MU, SPCX, NASDAQ, XU100, xau, THYAO, USDTRY)
     :return: (normalized_symbol, asset_type) where asset_type is 'CRYPTO' or 'EQUITY_FOREX'
     """
     clean = raw_symbol.strip().upper()
+    if not clean:
+        return "", "EQUITY_FOREX"
 
-    # Preserve explicit exchange prefixes like BINANCE: or BIST: or NASDAQ:
-    exchange_prefix = ""
+    # 0. Handle explicit exchange prefixes (preserves user disambiguation!)
     if ":" in clean:
-        exchange_prefix, clean = clean.split(":", 1)
-        exchange_prefix = exchange_prefix.strip()
-        clean = clean.strip()
+        prefix, body = clean.split(":", 1)
+        prefix = prefix.strip()
+        body = body.strip()
 
-    # 0. Honor explicit exchange prefixes before heuristic rules
-    if exchange_prefix == "BIST":
-        if clean in INDEX_MAP:
-            return INDEX_MAP[clean], "EQUITY_FOREX"
-        if clean.endswith(".IS"):
-            return clean, "EQUITY_FOREX"
-        return f"{clean}.IS", "EQUITY_FOREX"
+        if prefix in _BIST_PREFIXES:
+            if body in INDEX_MAP:
+                return INDEX_MAP[body], "EQUITY_FOREX"
+            if body in BIST_ALIASES:
+                return BIST_ALIASES[body], "EQUITY_FOREX"
+            if body.endswith(".IS"):
+                return body, "EQUITY_FOREX"
+            return f"{body}.IS", "EQUITY_FOREX"
 
-    if exchange_prefix in ("BINANCE", "BINANCEUS", "BYBIT", "OKX", "KUCOIN", "COINBASE", "KRAKEN"):
-        if clean in CRYPTO_SHORTHAND:
-            return CRYPTO_SHORTHAND[clean], "CRYPTO"
-        return clean, "CRYPTO"
+        if prefix in _US_EQUITY_PREFIXES:
+            mapped = EQUITY_ALIASES.get(body, body)
+            return mapped, "EQUITY_FOREX"
 
-    if exchange_prefix in ("NASDAQ", "NYSE", "AMEX", "ARCA", "BATS"):
-        return clean, "EQUITY_FOREX"
+        if prefix in _CRYPTO_PREFIXES:
+            body_clean = body.replace("/", "")
+            if body_clean in CRYPTO_SHORTHAND:
+                return CRYPTO_SHORTHAND[body_clean], "CRYPTO"
+            for quote in CRYPTO_QUOTE_CURRENCIES:
+                if body_clean.endswith(quote) and len(body_clean) > len(quote):
+                    return body_clean, "CRYPTO"
+            return f"{body_clean}USDT", "CRYPTO"
 
-    # 1. Check Major Indices (NASDAQ, XU100, BIST100, SP500, DXY, etc.)
+        if prefix in _FOREX_PREFIXES:
+            fx_clean = body.replace("/", "")
+            if not fx_clean.endswith("=X"):
+                fx_clean = f"{fx_clean}=X"
+            return fx_clean, "EQUITY_FOREX"
+
+        if prefix in _EXCHANGE_SUFFIX_MAP:
+            suffix = _EXCHANGE_SUFFIX_MAP[prefix]
+            if not body.endswith(suffix):
+                body = f"{body}{suffix}"
+            return body, "EQUITY_FOREX"
+
+        # Unknown prefix (e.g., TV:BTCUSDT) -> strip and continue standard classification
+        clean = body
+
+    # Normalize slash notation (e.g., BTC/USDT -> BTCUSDT, USD/TRY -> USDTRY, XAU/USD -> XAUUSD)
+    if "/" in clean:
+        clean = clean.replace("/", "")
+
+    # 1. Check Major Indices & Treasury Yields/Futures (NASDAQ, XU100, BIST100, SP500, SOX, DXY, etc.)
     if clean in INDEX_MAP:
         return INDEX_MAP[clean], "EQUITY_FOREX"
 
@@ -493,23 +146,35 @@ def classify_and_normalize(raw_symbol: str) -> Tuple[str, str]:
     if clean in COMMODITY_MAP:
         return COMMODITY_MAP[clean], "EQUITY_FOREX"
 
-    # 3. Check Crypto Shorthand (e.g. BTC -> BTCUSDT, ETH -> ETHUSDT)
+    # 3. Check Active Binance Crypto Shorthand (e.g. BTC -> BTCUSDT, HYPE -> HYPEUSDT)
     if clean in CRYPTO_SHORTHAND:
         return CRYPTO_SHORTHAND[clean], "CRYPTO"
 
-    # 4. Check Forex pairs
+    # 4. Check Non-Binance Major Cryptos routed to Yahoo Finance (TON, KAS, XMR, CRO, OKB, MNT, BGB)
+    if clean in YAHOO_CRYPTO_MAP:
+        return YAHOO_CRYPTO_MAP[clean], "EQUITY_FOREX"
+
+    # 5. Check Known US/Global Equities, ETFs & Equity Name Aliases (protects FBTC, GBTC, FETH, MU, SPCX)
+    if clean in EQUITY_ALIASES:
+        return EQUITY_ALIASES[clean], "EQUITY_FOREX"
+    if clean in KNOWN_EQUITIES:
+        return clean, "EQUITY_FOREX"
+
+    # 6. Check Forex pairs
     if clean in FOREX_PAIRS:
         return f"{clean}=X", "EQUITY_FOREX"
     if clean.endswith("=X"):
         return clean, "EQUITY_FOREX"
 
-    # 5. Check BIST symbols (known BIST indices are already handled in INDEX_MAP)
+    # 7. Check BIST aliases & BIST symbols (known BIST indices are already handled in INDEX_MAP)
+    if clean in BIST_ALIASES:
+        return BIST_ALIASES[clean], "EQUITY_FOREX"
     if clean.endswith(".IS"):
         return clean, "EQUITY_FOREX"
     if clean in BIST_POPULAR:
         return f"{clean}.IS", "EQUITY_FOREX"
 
-    # 6. Check Crypto patterns (e.g. BTCUSDT, ETHUSDT, SOLFDUSD, ETHBTC, DOGEBTC)
+    # 8. Check Binance Crypto quote patterns (e.g. BTCUSDT, ETHFDUSD, SOLUSDC, ETHBTC, DOGEBTC)
     # Stablecoin quote pairs (4+ char suffix): safe to match any non-empty base
     for quote in ("USDT", "FDUSD", "USDC"):
         if clean.endswith(quote) and len(clean) > len(quote):
@@ -522,227 +187,175 @@ def classify_and_normalize(raw_symbol: str) -> Tuple[str, str]:
             if base in CRYPTO_SHORTHAND or len(base) >= 3:
                 return clean, "CRYPTO"
 
-    # 7. Check if it ends with .F, =F (futures) or index ^
-    if clean.endswith("=F") or clean.startswith("^"):
+    # 9. Check Futures (=F), Indices (^), or Yahoo Crypto-USD (-USD)
+    if clean.endswith("=F") or clean.startswith("^") or clean.endswith("-USD"):
         return clean, "EQUITY_FOREX"
 
-    # Default fallback: Treat as EQUITY_FOREX (Yahoo Finance), supporting US stocks and BIST fallback
+    # Default fallback: Treat as EQUITY_FOREX (Yahoo Finance), supporting US/Global stocks and BIST fallback
     return clean, "EQUITY_FOREX"
 
 
-# ---------------------------------------------------------------------------
-# Rich Autocomplete Suggestions Catalog (Label, Value)
-# Max choices returned to Discord is 25, filtered by user search.
-# ---------------------------------------------------------------------------
-AUTOCOMPLETE_PRESETS = [
-    # Top Cryptocurrencies
-    ("BTCUSDT (Bitcoin / BTC)", "BTCUSDT"),
-    ("ETHUSDT (Ethereum / ETH)", "ETHUSDT"),
-    ("SOLUSDT (Solana / SOL)", "SOLUSDT"),
-    ("PEPEUSDT (Pepe Coin)", "PEPEUSDT"),
-    ("DOGEUSDT (Dogecoin / DOGE)", "DOGEUSDT"),
-    ("XRPUSDT (Ripple / XRP)", "XRPUSDT"),
-    ("AVAXUSDT (Avalanche / AVAX)", "AVAXUSDT"),
-    ("SUIUSDT (Sui Network)", "SUIUSDT"),
-    ("BNBUSDT (Binance Coin / BNB)", "BNBUSDT"),
-    ("LINKUSDT (Chainlink / LINK)", "LINKUSDT"),
-    ("NEARUSDT (Near Protocol)", "NEARUSDT"),
-    ("TONUSDT (Toncoin / Telegram)", "TONUSDT"),
-    ("SHIBUSDT (Shiba Inu / SHIB)", "SHIBUSDT"),
-    ("WIFUSDT (dogwifhat / WIF)", "WIFUSDT"),
-    ("APTUSDT (Aptos / APT)", "APTUSDT"),
-    ("FETUSDT (Artificial Superintelligence)", "FETUSDT"),
-    ("TAOUSDT (Bittensor / TAO)", "TAOUSDT"),
-    ("RENDERUSDT (Render / RNDR)", "RENDERUSDT"),
-    ("ARBUSDT (Arbitrum / ARB)", "ARBUSDT"),
-    ("OPUSDT (Optimism / OP)", "OPUSDT"),
-    ("TIAUSDT (Celestia / TIA)", "TIAUSDT"),
-    ("INJUSDT (Injective / INJ)", "INJUSDT"),
-    ("ONDOUSDT (Ondo Finance)", "ONDOUSDT"),
-    ("PENDLEUSDT (Pendle Yield)", "PENDLEUSDT"),
-    ("WLDUSDT (Worldcoin / WLD)", "WLDUSDT"),
-    ("BONKUSDT (Bonk / BONK)", "BONKUSDT"),
-    ("FLOKIUSDT (Floki Inu)", "FLOKIUSDT"),
-    ("POPCATUSDT (Popcat)", "POPCATUSDT"),
-    ("DOTUSDT (Polkadot / DOT)", "DOTUSDT"),
-    ("LTCUSDT (Litecoin / LTC)", "LTCUSDT"),
-    ("AAVEUSDT (Aave DeFi)", "AAVEUSDT"),
-    ("UNIUSDT (Uniswap / UNI)", "UNIUSDT"),
-    ("NOTUSDT (Notcoin / NOT)", "NOTUSDT"),
-    ("KASUSDT (Kaspa / KAS)", "KASUSDT"),
+# Precompute normalized lookup metadata for sub-millisecond ranked autocomplete
+_PresetEntry = Tuple[str, str, str, str, str, str, Tuple[str, ...]]
+_INDEXED_PRESETS: List[_PresetEntry] = []
 
-    # Commodities & Precious Metals
-    ("GOLD / XAU (Ons Altın / GC=F)", "GOLD"),
-    ("SILVER / XAG (Gümüş / SI=F)", "SILVER"),
-    ("BRENT (Brent Ham Petrol / BZ=F)", "BRENT"),
-    ("CRUDE / WTI (ABD Ham Petrol / CL=F)", "OIL"),
-    ("NATGAS (Doğal Gaz / NG=F)", "NATGAS"),
-    ("COPPER (Bakır / HG=F)", "COPPER"),
-    ("PLATINUM (Platin / PL=F)", "PLATINUM"),
-    ("COFFEE (Kahve / KC=F)", "COFFEE"),
-    ("WHEAT (Buğday / ZW=F)", "WHEAT"),
-    ("CORN (Mısır / ZC=F)", "CORN"),
-    ("SUGAR (Şeker / SB=F)", "SUGAR"),
-    ("COCOA (Kakao / CC=F)", "COCOA"),
-
-    # Major Global & Local Indices
-    ("XU100 (BIST 100 Endeksi)", "XU100"),
-    ("XU030 (BIST 30 Endeksi)", "XU030"),
-    ("XBANK (BIST Bankacılık Endeksi)", "XBANK"),
-    ("XUSIN (BIST Sınai Endeksi)", "XUSIN"),
-    ("NASDAQ (Nasdaq 100 / US100 / ^NDX)", "NASDAQ"),
-    ("NQ (E-mini Nasdaq 100 Vadeli / NQ=F)", "NQ"),
-    ("DJI (Dow Jones 30 / US30 / ^DJI)", "DJI"),
-    ("YM (E-mini Dow Jones Vadeli / YM=F)", "YM"),
-    ("SP500 (S&P 500 Endeksi / ^GSPC)", "SP500"),
-    ("ES (E-mini S&P 500 Vadeli / ES=F)", "ES"),
-    ("DAX (Almanya DAX 40 / GER40 / ^GDAXI)", "DAX"),
-    ("FTSE (İngiltere FTSE 100 / UK100 / ^FTSE)", "FTSE"),
-    ("CAC40 (Fransa CAC 40 / ^FCHI)", "CAC"),
-    ("NIKKEI (Japonya Nikkei 225 / ^N225)", "NIKKEI"),
-    ("HANGSENG (Hong Kong Hang Seng / ^HSI)", "HANGSENG"),
-    ("DXY (Dolar Endeksi / DX-Y.NYB)", "DXY"),
-    ("VIX (Korku / Volatilite Endeksi / ^VIX)", "VIX"),
-    ("US10Y (ABD 10 Yıllık Tahvil Faizi / ^TNX)", "US10Y"),
-
-    # Borsa Istanbul (BIST) Popular Equities
-    ("THYAO (Türk Hava Yolları)", "THYAO"),
-    ("ASELS (Aselsan Savunma)", "ASELS"),
-    ("GARAN (Garanti BBVA)", "GARAN"),
-    ("EREGL (Ereğli Demir Çelik)", "EREGL"),
-    ("SISE (Türkiye Şişecam)", "SISE"),
-    ("KCHOL (Koç Holding)", "KCHOL"),
-    ("TUPRS (Tüpraş Rafineri)", "TUPRS"),
-    ("AKBNK (Akbank)", "AKBNK"),
-    ("YKBNK (Yapı ve Kredi Bankası)", "YKBNK"),
-    ("SAHOL (Sabancı Holding)", "SAHOL"),
-    ("FROTO (Ford Otosan)", "FROTO"),
-    ("TOASO (Tofaş Otomobil)", "TOASO"),
-    ("BIMAS (BİM Birleşik Mağazalar)", "BIMAS"),
-    ("MGROS (Migros Ticaret)", "MGROS"),
-    ("PETKM (Petkim Petrokimya)", "PETKM"),
-    ("PGSUS (Pegasus Hava Taşımacılığı)", "PGSUS"),
-    ("TCELL (Turkcell İletişim)", "TCELL"),
-    ("TTKOM (Türk Telekom)", "TTKOM"),
-    ("KOZAL (Koza Altın)", "KOZAL"),
-    ("EKGYO (Emlak Konut GYO)", "EKGYO"),
-    ("ASTOR (Astor Enerji)", "ASTOR"),
-    ("KONTR (Kontrolmatik Teknoloji)", "KONTR"),
-    ("ALARK (Alarko Holding)", "ALARK"),
-    ("ODAS (Odaş Elektrik)", "ODAS"),
-    ("CANTE (Çan2 Termik)", "CANTE"),
-    ("EUPWR (Europower Enerji)", "EUPWR"),
-    ("CWENE (CW Enerji)", "CWENE"),
-    ("REEDR (Reeder Teknoloji)", "REEDR"),
-    ("MIATK (Mia Teknoloji)", "MIATK"),
-    ("BRSAN (Borusan Boru)", "BRSAN"),
-    ("TABGD (TAB Gıda)", "TABGD"),
-    ("TAVHL (TAV Havalimanları)", "TAVHL"),
-    ("CCOLA (Coca-Cola İçecek)", "CCOLA"),
-    ("MAVI (Mavi Giyim)", "MAVI"),
-    ("OTKAR (Otokar)", "OTKAR"),
-    ("ENJSA (Enerjisa Enerji)", "ENJSA"),
-    ("AKSEN (Aksa Enerji)", "AKSEN"),
-    ("ZOREN (Zorlu Enerji)", "ZOREN"),
-    ("SASA (Sasa Polyester)", "SASA"),
-    ("HEKTS (Hektaş)", "HEKTS"),
-    ("GUBRF (Gübre Fabrikaları)", "GUBRF"),
-    ("ULKER (Ülker Bisküvi)", "ULKER"),
-    ("AEFES (Anadolu Efes)", "AEFES"),
-    ("ISCTR (İş Bankası C)", "ISCTR"),
-    ("VAKBN (Vakıflar Bankası)", "VAKBN"),
-    ("HALKB (Halkbank)", "HALKB"),
-    ("KRDMD (Kardemir D)", "KRDMD"),
-    ("OYAKC (Oyak Çimento)", "OYAKC"),
-    ("CIMSA (Çimsa Çimento)", "CIMSA"),
-    ("SOKM (Şok Marketler)", "SOKM"),
-    ("DOAS (Doğuş Otomotiv)", "DOAS"),
-    ("CLEBI (Çelebi Hava Servisi)", "CLEBI"),
-    ("SDTTR (SDT Uzay ve Savunma)", "SDTTR"),
-    ("PAPIL (Papilon Savunma)", "PAPIL"),
-    ("ARDYZ (Ardıç Teknoloji)", "ARDYZ"),
-    ("PATEK (Pasifik Teknoloji)", "PATEK"),
-    ("BINHO (1000 Yatırımlar)", "BINHO"),
-    ("ALVES (Alves Kablo)", "ALVES"),
-    ("AGROT (Agrotech)", "AGROT"),
-    ("GESAN (Girişim Elektrik)", "GESAN"),
-    ("ALFAS (Alfa Solar Enerji)", "ALFAS"),
-    ("SMRTG (Smart Güneş Enerjisi)", "SMRTG"),
-    ("YEOTK (Yeo Teknoloji)", "YEOTK"),
-    ("MOGAN (Mogan Enerji)", "MOGAN"),
-    ("KOPOL (Koza Polyester)", "KOPOL"),
-    ("CVKMD (CVK Maden)", "CVKMD"),
-    ("FENER (Fenerbahçe Futbol)", "FENER"),
-    ("GSRAY (Galatasaray Sportif)", "GSRAY"),
-    ("BJKAS (Beşiktaş Futbol)", "BJKAS"),
-    ("TSPOR (Trabzonspor Sportif)", "TSPOR"),
-
-    # US & Global Equities (Tech Giants & Blue Chips)
-    ("NVDA (NVIDIA Corporation)", "NVDA"),
-    ("AAPL (Apple Inc.)", "AAPL"),
-    ("TSLA (Tesla Inc.)", "TSLA"),
-    ("MSFT (Microsoft Corporation)", "MSFT"),
-    ("AMZN (Amazon.com Inc.)", "AMZN"),
-    ("GOOGL (Alphabet / Google Class A)", "GOOGL"),
-    ("META (Meta Platforms / Facebook)", "META"),
-    ("NFLX (Netflix Inc.)", "NFLX"),
-    ("AMD (Advanced Micro Devices)", "AMD"),
-    ("INTC (Intel Corporation)", "INTC"),
-    ("PLTR (Palantir Technologies)", "PLTR"),
-    ("COIN (Coinbase Global)", "COIN"),
-    ("MSTR (MicroStrategy)", "MSTR"),
-    ("SMCI (Super Micro Computer)", "SMCI"),
-    ("AVGO (Broadcom Inc.)", "AVGO"),
-    ("QCOM (Qualcomm Inc.)", "QCOM"),
-    ("ARM (Arm Holdings)", "ARM"),
-    ("TSM (Taiwan Semiconductor / TSMC)", "TSM"),
-    ("BABA (Alibaba Group)", "BABA"),
-    ("UBER (Uber Technologies)", "UBER"),
-    ("DIS (Walt Disney Company)", "DIS"),
-    ("BA (Boeing Company)", "BA"),
-    ("JPM (JPMorgan Chase & Co.)", "JPM"),
-    ("V (Visa Inc.)", "V"),
-    ("MA (Mastercard Inc.)", "MA"),
-    ("NKE (Nike Inc.)", "NKE"),
-    ("SBUX (Starbucks Corp.)", "SBUX"),
-    ("MCD (McDonald's Corp.)", "MCD"),
-    ("WMT (Walmart Inc.)", "WMT"),
-    ("COST (Costco Wholesale)", "COST"),
-    ("KO (Coca-Cola US)", "KO"),
-    ("PEP (PepsiCo Inc.)", "PEP"),
-    ("XOM (Exxon Mobil Corp.)", "XOM"),
-    ("CVX (Chevron Corporation)", "CVX"),
-    ("LLY (Eli Lilly and Company)", "LLY"),
-    ("SPY (SPDR S&P 500 ETF Trust)", "SPY"),
-    ("QQQ (Invesco QQQ Trust ETF)", "QQQ"),
-
-    # Forex & Fiat Currency Pairs
-    ("USDTRY (Dolar / Türk Lirası)", "USDTRY"),
-    ("EURTRY (Euro / Türk Lirası)", "EURTRY"),
-    ("GBPTRY (İngiliz Sterlini / TL)", "GBPTRY"),
-    ("CHFTRY (İsviçre Frangı / TL)", "CHFTRY"),
-    ("EURUSD (Euro / Amerikan Doları)", "EURUSD"),
-    ("GBPUSD (İngiliz Sterlini / ABD Doları)", "GBPUSD"),
-    ("USDJPY (ABD Doları / Japon Yeni)", "USDJPY"),
-    ("USDCHF (ABD Doları / İsviçre Frangı)", "USDCHF"),
-    ("AUDUSD (Avustralya Doları / ABD Doları)", "AUDUSD"),
-    ("USDCAD (ABD Doları / Kanada Doları)", "USDCAD"),
-]
+for _label, _val in AUTOCOMPLETE_PRESETS:
+    _norm_val = _normalize_search_text(_val)
+    # Also compute bare ticker without exchange prefix or USDT suffix for exact-match detection
+    _bare_val = _norm_val.split(":", 1)[1] if ":" in _norm_val else _norm_val
+    if _bare_val.endswith("USDT") and len(_bare_val) > 4:
+        _short_base = _bare_val[:-4]
+    else:
+        _short_base = _bare_val
+    _canonical_target, _ = classify_and_normalize(_val)
+    _norm_target = _normalize_search_text(_canonical_target)
+    _norm_label = _normalize_search_text(_label)
+    _label_words = tuple(w for w in _WORD_SPLIT_RE.split(_norm_label) if w)
+    _INDEXED_PRESETS.append((_label, _val, _norm_val, _short_base, _norm_target, _norm_label, _label_words))
 
 
-def get_symbol_autocomplete(current: str) -> list[tuple[str, str]]:
-    """Return filtered autocomplete choices matching user input (max 25 choices for Discord)."""
-    clean = current.strip().upper()
-    if not clean:
-        return AUTOCOMPLETE_PRESETS[:25]
+def _resolve_alias_target(clean_norm: str) -> Optional[str]:
+    """If the user typed a known alias (e.g. SPACEX, ALTIN, KOZAL, US30, FTM), return its canonical target."""
+    for mapping in (EQUITY_ALIASES, INDEX_MAP, COMMODITY_MAP, CRYPTO_SHORTHAND, YAHOO_CRYPTO_MAP, BIST_ALIASES):
+        if clean_norm in mapping:
+            return _normalize_search_text(mapping[clean_norm])
+    return None
 
-    matches = []
-    for label, val in AUTOCOMPLETE_PRESETS:
-        if clean in val.upper() or clean in label.upper():
-            matches.append((label, val))
 
-    # If user typed a custom ticker not in presets, keep custom at the top
-    if not any(val.upper() == clean for _, val in matches):
-        matches.insert(0, (f"Özel Sembol: {clean}", clean))
+def _rank_local_presets(
+    clean_norm: str,
+    live_crypto_symbols: Optional[Iterable[str]] = None,
+) -> Tuple[List[Tuple[str, str]], bool]:
+    """Return ranked (label, value) matches and whether an exact match was found."""
+    alias_norm = _resolve_alias_target(clean_norm)
+
+    tier0: List[Tuple[str, str]] = []  # Exact ticker / exact alias / exact base match
+    tier1: List[Tuple[str, str]] = []  # Ticker prefix match
+    tier2: List[Tuple[str, str]] = []  # Label word-prefix match (e.g. MICRON, SPACEX, ALTIN)
+    tier3: List[Tuple[str, str]] = []  # General substring match
+
+    seen_vals = set()
+    has_exact = False
+
+    for label, val, norm_val, short_base, norm_target, norm_label, label_words in _INDEXED_PRESETS:
+        bare_val = norm_val.split(":", 1)[1] if ":" in norm_val else norm_val
+
+        if (
+            clean_norm == norm_val
+            or clean_norm == bare_val
+            or clean_norm == short_base
+            or (alias_norm is not None and (alias_norm == norm_target or alias_norm == norm_val or alias_norm == bare_val))
+        ):
+            tier0.append(_truncate_choice(label, val))
+            seen_vals.add(val.upper())
+            has_exact = True
+        elif norm_val.startswith(clean_norm) or bare_val.startswith(clean_norm) or short_base.startswith(clean_norm):
+            tier1.append(_truncate_choice(label, val))
+            seen_vals.add(val.upper())
+        elif any(w.startswith(clean_norm) for w in label_words):
+            tier2.append(_truncate_choice(label, val))
+            seen_vals.add(val.upper())
+        elif clean_norm in norm_val or clean_norm in norm_label:
+            tier3.append(_truncate_choice(label, val))
+            seen_vals.add(val.upper())
+
+    # Dynamically include any live Binance symbols discovered via WebSocket stream
+    if live_crypto_symbols:
+        live_exact: List[Tuple[str, str]] = []
+        live_prefix: List[Tuple[str, str]] = []
+        for raw_sym in live_crypto_symbols:
+            sym = raw_sym.upper().strip()
+            if not sym or sym in seen_vals:
+                continue
+            if not sym.endswith(("USDT", "FDUSD", "USDC")):
+                continue
+            base = sym[:-4] if sym.endswith(("USDT", "USDC")) else sym[:-5]
+            if clean_norm == sym or clean_norm == base:
+                live_exact.append(_truncate_choice(f"{sym} (Binance Spot Live)", sym))
+                seen_vals.add(sym)
+                has_exact = True
+            elif sym.startswith(clean_norm) or base.startswith(clean_norm):
+                live_prefix.append(_truncate_choice(f"{sym} (Binance Spot Live)", sym))
+                seen_vals.add(sym)
+        tier0.extend(live_exact[:5])
+        tier1.extend(sorted(live_prefix)[:10])
+
+    ranked = tier0 + tier1 + tier2 + tier3
+    return ranked, has_exact
+
+
+def get_symbol_autocomplete(
+    current: str,
+    live_crypto_symbols: Optional[Iterable[str]] = None,
+) -> List[Tuple[str, str]]:
+    """Return ranked autocomplete choices matching user input (max 25 choices for Discord)."""
+    clean_raw = current.strip().upper()
+    if not clean_raw:
+        return [_truncate_choice(lbl, val) for lbl, val in AUTOCOMPLETE_PRESETS[:25]]
+
+    clean_norm = _normalize_search_text(clean_raw)
+    matches, has_exact = _rank_local_presets(clean_norm, live_crypto_symbols=live_crypto_symbols)
+
+    # If user typed a custom ticker not matched as an exact preset, keep custom option at top
+    if not has_exact and not any(val.upper() == clean_raw for _, val in matches):
+        matches.insert(0, _truncate_choice(f"Özel Sembol: {clean_raw}", clean_raw))
 
     return matches[:25]
+
+
+async def get_symbol_autocomplete_async(
+    current: str,
+    yahoo_feed=None,
+    live_crypto_symbols: Optional[Iterable[str]] = None,
+    yahoo_timeout: float = 1.2,
+) -> List[Tuple[str, str]]:
+    """Hybrid autocomplete combining instant local ranked catalog, live Binance WS tickers,
+    and an optional fast Yahoo Finance search fallback for any global ticker on Earth.
+    """
+    clean_raw = current.strip().upper()
+    if not clean_raw:
+        return [_truncate_choice(lbl, val) for lbl, val in AUTOCOMPLETE_PRESETS[:25]]
+
+    clean_norm = _normalize_search_text(clean_raw)
+    local_matches, has_exact = _rank_local_presets(clean_norm, live_crypto_symbols=live_crypto_symbols)
+
+    # Trigger live Yahoo Finance search only when query >= 2 chars and not already an exact curated hit
+    # (or very few local suggestions exist)
+    yahoo_matches: List[Tuple[str, str]] = []
+    if yahoo_feed is not None and len(clean_raw) >= 2 and (not has_exact or len(local_matches) < 5):
+        try:
+            yahoo_matches = await asyncio.wait_for(
+                yahoo_feed.search_symbols(clean_raw, limit=8),
+                timeout=yahoo_timeout,
+            )
+        except Exception:
+            yahoo_matches = []
+
+    merged: List[Tuple[str, str]] = []
+    seen_vals = set()
+
+    # Exact Yahoo matches first if local didn't have an exact match
+    yahoo_exact: List[Tuple[str, str]] = []
+    yahoo_rest: List[Tuple[str, str]] = []
+    for lbl, val in yahoo_matches:
+        val_upper = val.upper()
+        bare = val_upper[:-3] if val_upper.endswith(".IS") else val_upper
+        if not has_exact and (val_upper == clean_raw or bare == clean_raw):
+            yahoo_exact.append(_truncate_choice(lbl, val))
+        else:
+            yahoo_rest.append(_truncate_choice(lbl, val))
+
+    for group in (yahoo_exact, local_matches, yahoo_rest):
+        for lbl, val in group:
+            key = val.upper()
+            if key not in seen_vals:
+                seen_vals.add(key)
+                merged.append((lbl, val))
+
+    if not has_exact and not any(
+        val.upper() == clean_raw or (val.upper().endswith(".IS") and val.upper()[:-3] == clean_raw)
+        for _, val in merged
+    ):
+        merged.insert(0, _truncate_choice(f"Özel Sembol: {clean_raw}", clean_raw))
+
+    return merged[:25]

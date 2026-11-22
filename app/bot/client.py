@@ -11,7 +11,11 @@ from discord import app_commands
 from discord.ext import commands
 from app.config import Settings
 from app.database.db import AlertRecord
-from app.market_data.symbols import classify_and_normalize, get_symbol_autocomplete
+from app.market_data.symbols import (
+    classify_and_normalize,
+    get_symbol_autocomplete,
+    get_symbol_autocomplete_async,
+)
 from app.market_data.yahoo import is_valid_yahoo_symbol
 from app.services.alert_engine import AutonomousAlertEngine
 
@@ -90,9 +94,29 @@ async def safe_followup_send(
 
 
 async def symbol_autocomplete_handler(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    """Provide real-time symbol search suggestions for slash commands."""
-    suggestions = get_symbol_autocomplete(current)
-    return [app_commands.Choice(name=label, value=val) for label, val in suggestions]
+    """Provide real-time hybrid symbol search suggestions for slash commands.
+
+    Combines instant local ranked catalog (500+ presets), live Binance WebSocket symbols,
+    and a fast Yahoo Finance Search fallback for any global stock/ETF/index ticker.
+    """
+    yahoo_feed = None
+    live_crypto_symbols = None
+
+    client = getattr(interaction, "client", None)
+    engine = getattr(client, "engine", None) if client is not None else None
+    feed = getattr(engine, "feed", None) if engine is not None else None
+    if feed is not None:
+        yahoo_feed = getattr(feed, "yahoo", None)
+        price_cache = getattr(feed, "price_cache", None)
+        if isinstance(price_cache, dict) and price_cache:
+            live_crypto_symbols = list(price_cache.keys())
+
+    suggestions = await get_symbol_autocomplete_async(
+        current,
+        yahoo_feed=yahoo_feed,
+        live_crypto_symbols=live_crypto_symbols,
+    )
+    return [app_commands.Choice(name=label[:100], value=val[:100]) for label, val in suggestions[:25]]
 
 
 class RearmAlertModal(discord.ui.Modal, title="🔄 Alarmı Yeniden Kur"):
@@ -352,7 +376,7 @@ class HelpCategorySelect(discord.ui.Select):
                 name="⚡ Temel Yetenekler",
                 value=(
                     "• **Otonom Fiyat Alarmları:** İstediğiniz fiyata veya yüzdesel değişime (`+5%`, `-3%`) alarm kurun.\n"
-                    "• **Zengin Varlık Yelpazesi:** 120+ Kripto, 100+ BIST hissesi, Nasdaq, Dow Jones, Altın, Petrol, Döviz.\n"
+                    "• **Geniş Varlık Yelpazesi:** 210+ Kripto, 560+ BIST hissesi, 390+ ABD/Global hisse & ETF (`MU`, `SPCX`, `NVDA`, `SMH`, `IBIT`), Altın, Petrol, Döviz ve canlı global arama.\n"
                     "• **Kişisel Takip Listesi:** `/watchlist` ile portföyünüzün anlık değerlerini tek ekranda görün.\n"
                     "• **Özel Mesaj (DM) Desteği:** Alarmları sunucu yerine doğrudan özel mesajla alın.\n"
                     "• **TradingView Köprüsü:** Pine Script ve TradingView strateji sinyallerini anında iletin."
@@ -423,23 +447,23 @@ class HelpCategorySelect(discord.ui.Select):
                 color=0x9B59B6,
             )
             embed.add_field(
-                name="🪙 Kripto Paralar (Binance)",
-                value="`BTC`, `ETH`, `SOL`, `PEPE`, `SUI`, `AVAX`, `DOGE`, `TON`, `RENDER`, `TAO`, `NEAR` vb. (Doğrudan kısaltma yeterlidir).",
+                name="🪙 Kripto Paralar (Binance + Yahoo)",
+                value="`BTC`, `ETH`, `SOL`, `HYPE`, `PEPE`, `SUI`, `AVAX`, `DOGE`, `XRP`, `RENDER`, `TAO`, `NEAR`, `PAXG`, `TON`, `KAS`, `XMR` vb. (Tüm 500+ Binance USDT paritesi canlı desteklenir).",
                 inline=False,
             )
             embed.add_field(
-                name="🇹🇷 Borsa İstanbul (BIST)",
-                value="`THYAO`, `ASELS`, `GARAN`, `EREGL`, `SISE`, `KCHOL`, `TUPRS`, `ASTOR`, `REEDR`, `XU100`, `XU030` vb. (Sonuna `.IS` yazmanız gerekmez).",
+                name="🇺🇸 ABD, Global Hisseler & ETF'ler",
+                value="`NVDA`, `MU` (Micron), `SPCX` (SpaceX), `AAPL`, `TSLA`, `MSFT`, `PLTR`, `AMD`, `RKLB`, `ASTS`, `OKLO`, `IONQ`, `SMH`, `IBIT`, `RHM.DE`, `MC.PA` vb. (Borsa öneki destekli: `NASDAQ:DASH`, `NYSE:AR`).",
                 inline=False,
             )
             embed.add_field(
-                name="🏆 Emtialar",
-                value="`GOLD` veya `ALTIN` (Ons Altın), `SILVER` veya `GUMUS`, `BRENT` (Ham Petrol), `NATGAS` (Doğal Gaz), `COPPER` (Bakır).",
+                name="🇹🇷 Borsa İstanbul (560+ BIST Hissesi)",
+                value="`THYAO`, `ASELS`, `GARAN`, `EREGL`, `SISE`, `KCHOL`, `TUPRS`, `DOAS`, `ASTOR`, `TRALT`, `XU100`, `XU030` vb. (Sonuna `.IS` yazmanız gerekmez; `BIST:LINK` desteklenir).",
                 inline=False,
             )
             embed.add_field(
-                name="🌐 Dünya Endeksleri & Döviz",
-                value="`NASDAQ`, `DJI` (Dow Jones / US30), `SP500`, `DAX`, `DXY` (Dolar Endeksi), `USDTRY`, `EURTRY`, `EURUSD`.",
+                name="🏆 Emtialar & 🌐 Dünya Endeksleri & 💱 Döviz",
+                value="`GOLD`/`ALTIN`, `SILVER`/`GUMUS`, `BRENT`, `WTI`, `NATGAS`, `COPPER`, `NASDAQ`, `SP500`, `DJI`, `SOX`, `DAX`, `DXY`, `VIX`, `US10Y`, `USDTRY`, `EURTRY`, `EURUSD` (90+ döviz çifti).",
                 inline=False,
             )
         elif cat == "tradingview":

@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-103%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-108%20passed-brightgreen.svg)](tests/)
 
 A high-performance, self-hosted, autonomous price monitoring and notification service designed to bypass TradingView free-tier alert limits and provide institutional-grade alerts on your own infrastructure.
 
@@ -106,25 +106,25 @@ Konteynerler ayağa kalktığında bot otomatik olarak `warp` proxy'si üzerinde
 
 ## 📈 Desteklenen Semboller ve Yazım Formatları
 
-Sistem kullanıcı dostu akıllı sembol ayrıştırıcısına (`symbols.py`) sahiptir. Discord'da arama yaparken otomatik tamamlama listesinden seçim yapabilir veya doğrudan kısaltmasını yazabilirsiniz:
+Sistem kullanıcı dostu akıllı sembol ayrıştırıcısına (`symbols.py` & `symbol_catalog.py`) ve **775+ hazır öneri + canlı Binance/Yahoo Finance araması** sunan hibrit Discord otomatik tamamlama motoruna sahiptir:
 
-* **🪙 Kripto Paralar (Binance Spot):** `BTC`, `ETH`, `SOL`, `PEPE`, `SUI`, `AVAX`, `DOGE`, `TON`, `RENDER`, `TAO`, `NEAR`, `ARB`, `OP`, `TIA`, `INJ` vb. (Doğrudan kısaltma yeterlidir, otomatik `*USDT` olarak eşlenir).
-* **🇹🇷 Borsa İstanbul (100+ BIST Hissesi):** `THYAO`, `ASELS`, `GARAN`, `EREGL`, `SISE`, `KCHOL`, `TUPRS`, `ASTOR`, `REEDR`, `MIATK`, `EUPWR`, `CCOLA`, `MAVI`, `BIMAS` vb. (Sonuna `.IS` yazmanız gerekmez).
-* **🏆 Emtialar (Commodities):**
-  * `GOLD` veya `ALTIN` (Ons Altın Futures: `GC=F`)
-  * `SILVER` veya `GUMUS` (Ons Gümüş Futures: `SI=F`)
-  * `BRENT` (Brent Petrol: `BZ=F`)
-  * `OIL` veya `WTI` (ABD Ham Petrol: `CL=F`)
-  * `NATGAS` veya `DOGALGAZ` (Doğal Gaz: `NG=F`)
-  * `COPPER` veya `BAKIR` (`HG=F`), `PLATINUM` (`PL=F`), `COFFEE`, `WHEAT`
-* **🌐 Dünya Endeksleri:**
-  * `NASDAQ` (Nasdaq 100 Endeksi: `^NDX`), `NQ` (E-mini Nasdaq Vadeli: `NQ=F`)
-  * `DJI`, `DOW`, `US30` (Dow Jones 30 Endeksi: `^DJI`), `YM` (Dow Jones Vadeli: `YM=F`)
-  * `SP500`, `SPX` (S&P 500: `^GSPC`), `ES` (S&P 500 Vadeli: `ES=F`)
-  * `DAX` / `GER40` (`^GDAXI`), `FTSE` / `UK100` (`^FTSE`), `VIX` (Korku Endeksi), `DXY` (Dolar Endeksi)
-  * `XU100` (BIST 100), `XU030` (BIST 30), `XBANK` (Bankacılık), `XUSIN` (Sınai)
-* **💱 Döviz & Forex Kurları:** `USDTRY`, `EURTRY`, `GBPTRY`, `EURUSD`, `GBPUSD`, `USDJPY` vb. (Otomatik `=X` eklenir).
-* **🇺🇸 ABD Dev Şirketleri:** `NVDA`, `AAPL`, `TSLA`, `MSFT`, `AMZN`, `GOOGL`, `META`, `NFLX`, `AMD`, `PLTR`, `COIN`, `MSTR`
+* **🪙 Kripto Paralar (Binance Spot + Yahoo Finance):** `BTC`, `ETH`, `SOL`, `HYPE`, `PEPE`, `SUI`, `AVAX`, `DOGE`, `XRP`, `RENDER`, `TAO`, `NEAR`, `PAXG`, `XAUT`, `PUMP`, `ARB`, `OP`, `TIA`, `INJ`, `TON`, `KAS`, `XMR` vb. (320+ canlı doğrulanmış kısaltma ve tüm 500+ Binance USDT paritesi canlı desteklenir).
+* **🇺🇸 ABD & Global Hisseler + ETF'ler (390+ Doğrulanmış Varlık):**
+  * **Teknoloji, Yarı İletken, Yapay Zeka & Uzay:** `NVDA`, `MU` (Micron), `SPCX` (SpaceX), `AAPL`, `TSLA`, `MSFT`, `AMZN`, `GOOGL`, `META`, `AVGO`, `AMD`, `INTC`, `TSM`, `ASML`, `ARM`, `PLTR`, `ORCL`, `CRWD`, `SNDK`, `NBIS`, `CRWV`, `RKLB`, `ASTS`, `OKLO`, `IONQ`, `QBTS`, `RGTI`, `COIN`, `MSTR`, `CRCL`, `HOOD`
+  * **ETF'ler:** `SPY`, `VOO`, `QQQ`, `TQQQ`, `SQQQ`, `SMH`, `SOXX`, `SOXL`, `SOXS`, `SPCH`, `SSPC`, `MUU`, `IBIT`, `FBTC`, `ETHA`, `GLD`, `SLV`, `TLT`, `SHLD`, `ITA`, `ARKX`, `URA`, `TUR`
+  * **Avrupa & Asya Devleri:** `RHM.DE`, `SIE.DE`, `MC.PA`, `AIR.PA`, `ASML.AS`, `NOVO-B.CO`, `HSBA.L`, `7203.T`, `0700.HK`, `9988.HK`, `BABA`, `PDD`, `NIO`, `BYDDY`
+* **🇹🇷 Borsa İstanbul (570+ Doğrulanmış BIST Hissesi):** `THYAO`, `ASELS`, `GARAN`, `EREGL`, `SISE`, `KCHOL`, `TUPRS`, `DOAS`, `ASTOR`, `TRALT` (`KOZAL`), `TRMET` (`KOZAA`), `QNBTR` (`QNBFB`), `REEDR`, `MIATK`, `EUPWR`, `CCOLA`, `MAVI`, `BIMAS`, `SDTTR`, `ALTNY` vb. (Sonuna `.IS` yazmanız gerekmez; eski hisse kodları otomatik yeni kodlara yönlendirilir).
+* **🏆 Emtialar (75+ Türkçe/İngilizce Eşleme):**
+  * `GOLD`/`ALTIN` (`GC=F`), `MGC`, `SILVER`/`GUMUS` (`SI=F`), `PLATINUM`/`PLATIN` (`PL=F`), `PALLADIUM` (`PA=F`), `COPPER`/`BAKIR` (`HG=F`), `ALUMINUM` (`ALI=F`)
+  * `BRENT` (`BZ=F`), `OIL`/`WTI` (`CL=F`), `NATGAS`/`DOGALGAZ` (`NG=F`), `GASOLINE`/`BENZIN` (`RB=F`), `HEATINGOIL` (`HO=F`)
+  * `WHEAT`/`BUGDAY`, `CORN`/`MISIR`, `SOYBEAN`, `COFFEE`/`KAHVE`, `SUGAR`/`SEKER`, `COTTON`/`PAMUK`, `COCOA`/`KAKAO`, `LUMBER`/`KERESTE`, `ORANGEJUICE`/`PORTAKAL`, `OATS`, `RICE`, `LIVECATTLE`
+* **🌐 Dünya & BIST Endeksleri + Tahvil Faizleri/Vadelileri (150+ Eşleme):**
+  * `NASDAQ` (`^NDX`), `NQ`/`MNQ`, `SP500`/`SPX` (`^GSPC`), `ES`/`MES`, `DJI`/`US30` (`^DJI`), `YM`, `RUSSELL` (`^RUT`), `RTY`, `SOX` (`^SOX` Yarı İletken Endeksi)
+  * `DAX`/`GER40`, `FTSE`/`UK100`, `CAC40`, `EUROSTOXX`, `IBEX`, `FTSEMIB`, `AEX`, `SMI`, `NIKKEI`, `HANGSENG`, `KOSPI`, `TWII`, `NIFTY`, `ASX200`, `BOVESPA`
+  * `DXY` (Dolar Endeksi), `VIX` (Korku Endeksi), `US10Y`, `US30Y`, `US05Y`, `US02Y`, `ZN`, `ZB`
+  * `XU100`, `XU050`, `XU030`, `XUTUM`, `XBANK`, `XUSIN`, `XUMAL`, `XUHIZ`, `XULAS`, `XK100`, `XK030`, `XUTEK`, `XBLSM`
+* **💱 Döviz & Forex Kurları (84+ Doğrulanmış Çift):** `USDTRY`, `EURTRY`, `GBPTRY`, `CHFTRY`, `AEDTRY`, `EURUSD`, `GBPUSD`, `USDJPY`, `EURPLN`, `USDSAR` vb. (`USD/TRY` gibi eğik çizgili yazımlar da desteklenir).
+* **🔀 Borsa Öneki & Canlı Global Arama:** Çakışan sembollerde borsa öneki kullanabilirsiniz (`BIST:LINK`, `NASDAQ:DASH`, `NYSE:AR`, `BINANCE:S`, `XETR:RHM`). Hazır listede olmayan herhangi bir hisse/ETF yazdığınızda Discord otomatik tamamlama anlık olarak Yahoo Finance üzerinden canlı arama yapar.
 
 ---
 
@@ -193,9 +193,9 @@ python -m pytest tests -v
 ```
 
 ```text
-======================== 103 passed ========================
+======================== 108 passed ========================
 ```
-Authentication, dual parser, token bucket rate limiter, SQLite işlemleri, watchlist, DM bildirimleri, yüzdesel alarmlar, cache tazeliği, sembol sınıflandırması, piyasa beslemeleri (Binance/Yahoo), bot komutları ve tetikleyici motoru dahil **103 testin tamamı %100 yeşildir**.
+Authentication, dual parser, token bucket rate limiter, SQLite işlemleri, watchlist, DM bildirimleri, yüzdesel alarmlar, cache tazeliği, genişletilmiş sembol kataloğu, hibrit canlı arama, borsa öneki ayrıştırması, piyasa beslemeleri (Binance/Yahoo), bot komutları ve tetikleyici motoru dahil **108 testin tamamı %100 yeşildir**.
 
 ---
 

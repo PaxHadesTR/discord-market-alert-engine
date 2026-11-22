@@ -95,3 +95,15 @@
   3. *Gateway Lifecycle Observability*: Implement `on_connect`, `on_resumed`, `on_disconnect`, and `on_error` listeners in `DiscordAlertBot`, and enforce INFO level for `discord` logger hierarchy.
   4. *Alert Delivery Integrity & Rate Limit Protection*: Add `reset_alert_to_active` rollback in `app/database/db.py` when dispatch fails or client is reconnecting, preventing lost alerts. Implement single global command sync in `app/bot/client.py` to prevent hitting Discord's 200/day slash command rate limit during reconnect cycles.
 * **Outcome**: Resilient self-healing bot connections under proxy/network instability, zero deadlocks, transparent logging, zero lost alerts, and reliable container orchestration via Docker healthchecks.
+
+---
+
+## ADR-011: Expanded Live-Verified Multi-Market Catalog & Hybrid Live Autocomplete
+* **Date**: 2026-11-22
+* **Status**: ACCEPTED
+* **Context**: The static autocomplete preset list (~165 items) omitted high-demand tickers (such as `MU`, `SPCX`, semiconductor/space/nuclear/quantum stocks, spot crypto ETFs, European/Asian leaders, and hundreds of BIST stocks), contained legacy delisted/rebranded symbols (`KOZAL`, `QNBFB`, `FTM`, `MKR`, `SHIBAUSDT`, broken TRY FX crosses), lacked exchange-prefix disambiguation, and suffered from linear substring matching and suffix collisions (`FBTC`/`GBTC`/`FETH` misrouted to Binance).
+* **Decision**:
+  1. *Modular Live-Verified Catalog (`app/market_data/symbol_catalog.py`)*: Expand and audit all catalogs against live Binance and Yahoo Finance APIs — 570 BIST stocks + 40 rebranding/company aliases, 394 US/Global equities & ETFs + 70 aliases, 324 active Binance USDT shorthands, 17 non-Binance Yahoo Finance cryptos (`TON`, `KAS`, `XMR`, `CRO`, `OKB`, `MNT`, `BGB`), 152 global/BIST index & bond mappings, 84 Forex pairs, 75 commodity aliases, and 776 ranked autocomplete presets.
+  2. *Prefix-Aware Classification & Collision Protection (`app/market_data/symbols.py`)*: Preserve explicit exchange prefixes (`BIST:`, `NASDAQ:`, `NYSE:`, `BINANCE:`, `FX:`, `XETR:`, `EPA:`, `LSE:`, `TSE:`, `HKEX:`), normalize slash pairs (`USD/TRY`, `BTC/USDT`), and protect `KNOWN_EQUITIES` (e.g. `FBTC`, `GBTC`, `FETH`, `CVX`, `STX`) from crypto suffix/shorthand collisions.
+  3. *Hybrid Ranked Autocomplete (`symbols.py`, `yahoo.py`, `client.py`)*: Combine sub-millisecond 4-tier Turkish-diacritic-insensitive local ranking, dynamic live Binance WebSocket ticker discovery, and a timeout-bounded (1.2s) LRU/TTL-cached Yahoo Finance Search fallback (`v1/finance/search`) so any global ticker is discoverable without risking Discord's 3-second autocomplete timeout.
+* **Outcome**: Comprehensive global market coverage across Crypto, BIST, US/Global Equities, ETFs, Indices, Commodities, and Forex with zero broken legacy entries and resilient live discovery for newly listed instruments.
