@@ -107,3 +107,15 @@
   2. *Prefix-Aware Classification & Collision Protection (`app/market_data/symbols.py`)*: Preserve explicit exchange prefixes (`BIST:`, `NASDAQ:`, `NYSE:`, `BINANCE:`, `FX:`, `XETR:`, `EPA:`, `LSE:`, `TSE:`, `HKEX:`), normalize slash pairs (`USD/TRY`, `BTC/USDT`), and protect `KNOWN_EQUITIES` (e.g. `FBTC`, `GBTC`, `FETH`, `CVX`, `STX`) from crypto suffix/shorthand collisions.
   3. *Hybrid Ranked Autocomplete (`symbols.py`, `yahoo.py`, `client.py`)*: Combine sub-millisecond 4-tier Turkish-diacritic-insensitive local ranking, dynamic live Binance WebSocket ticker discovery, and a timeout-bounded (1.2s) LRU/TTL-cached Yahoo Finance Search fallback (`v1/finance/search`) so any global ticker is discoverable without risking Discord's 3-second autocomplete timeout.
 * **Outcome**: Comprehensive global market coverage across Crypto, BIST, US/Global Equities, ETFs, Indices, Commodities, and Forex with zero broken legacy entries and resilient live discovery for newly listed instruments.
+
+---
+
+## ADR-012: Outbound Proxy 503 Resilience, Multi-Proxy Failover, Direct Fallback & WARP Sidecar Hardening
+* **Date**: 2026-11-22
+* **Status**: ACCEPTED
+* **Context**: In production, `caomingjun/warp` (`http://warp:1080`) returned repeated `ClientHttpProxyError: 503 Service Unavailable` when its internal `warp-svc` tunnel disconnected or lacked `/dev/net/tun` cgroup permissions, causing `/live` to fail with 503 while the supervisor looped blindly (even logging `step 5/4` due to unclamped backoff display) without exposing proxy failure diagnostics or attempting failover.
+* **Decision**:
+  1. *WARP Sidecar Hardening (`docker-compose.yml`, `README.md`)*: Add `device_cgroup_rules: ['c 10:200 rwm']`, increase `WARP_SLEEP=8`, add a real tunnel `healthcheck` (`curl -fsS -x http://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -Eq 'warp=(on|plus)'`), and require `depends_on: warp: condition: service_healthy`.
+  2. *Multi-Proxy Failover & Direct Fallback (`app/config.py`, `app/bot/client.py`, `app/main.py`)*: Parse comma-separated `DISCORD_PROXY` failover lists, detect proxy connection/503 errors (`is_proxy_connection_error`), rotate across backup proxies on failure, and optionally probe direct connection (`DISCORD_PROXY_FALLBACK_DIRECT=true`) after consecutive proxy failures — automatically returning to the configured proxy if direct is DPI-blocked.
+  3. *Observability & Backoff Fix (`app/main.py`, `app/routes/health.py`)*: Clamp backoff step display (`step 4/4, attempt #N`), emit actionable WARP recovery hints, and surface `last_error`, `active_proxy`, and `proxy_failures` in `/live` and `/healthz`.
+* **Outcome**: Prevents proxy startup race conditions, eliminates silent 503 loops on both blocked and non-blocked hosts, and guards against configuration regressions via automated tests.

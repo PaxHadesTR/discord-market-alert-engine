@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-108%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-114%20passed-brightgreen.svg)](tests/)
 
 A high-performance, self-hosted, autonomous price monitoring and notification service designed to bypass TradingView free-tier alert limits and provide institutional-grade alerts on your own infrastructure.
 
@@ -27,24 +27,28 @@ docker run -d \
   --name warp \
   --restart always \
   --network coolify \
+  --device-cgroup-rule='c 10:200 rwm' \
   --cap-add NET_ADMIN \
   --cap-add MKNOD \
   --cap-add AUDIT_WRITE \
   --sysctl net.ipv6.conf.all.disable_ipv6=0 \
   --sysctl net.ipv4.conf.all.src_valid_mark=1 \
-  -e WARP_SLEEP=5 \
+  -e WARP_SLEEP=8 \
   -v warp_data:/var/lib/cloudflare-warp \
   caomingjun/warp:latest
 ```
-Ardından Coolify'da **Environment Variables** kısmına şunu ekleyin:
+Ardından Coolify'da **Environment Variables** kısmına şunu ekleyin (birden fazla yedek proxy için virgülle ayırabilirsiniz):
 ```env
 DISCORD_PROXY=http://warp:1080
+DISCORD_PROXY_FALLBACK_DIRECT=true
 ```
 Konteyneri **Restart** ettiğinizde bot engeli tamamen aşarak Discord'a bağlanacaktır.
 
-> **💡 İpucu (Proxy Durum Kontrolü):**
-> Bağlantı durumunu kontrol etmek için: `docker exec warp warp-cli status` (Connected yazmalıdır).
-> Eğer nadiren bağlantı koparsa: `docker exec warp warp-cli connect` komutuyla hemen yeniden bağlayabilirsiniz.
+> **💡 İpucu (Proxy `503 Service Unavailable` Durum Kontrolü):**
+> `http://warp:1080` üzerinden `503 Service Unavailable` hatası alırsanız, `warp` konteyneri içindeki Cloudflare tüneli (`warp-svc`) kopmuştur veya `/dev/net/tun` izni eksiktir:
+> 1. Tünel durumunu doğrulayın: `docker exec warp curl -s -x http://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep warp=` (`warp=on` veya `warp=plus` yazmalıdır).
+> 2. Bağlantı kopmuşsa yeniden bağlayın/yeniden başlatın: `docker exec warp warp-cli connect` veya `docker restart warp`.
+> 3. Sorun devam ederse bozuk oturum verisini sıfırlayın: `docker rm -f warp && docker volume rm warp_data` ve yukarıdaki `--device-cgroup-rule='c 10:200 rwm'` bayraklı komutla yeniden başlatın.
 
 #### 2. Standart Docker Compose ile Kullanıyorsanız
 Proje kökündeki `docker-compose.yml` dosyasına `warp` servisi zaten eklenmiştir:
@@ -193,9 +197,9 @@ python -m pytest tests -v
 ```
 
 ```text
-======================== 108 passed ========================
+======================== 114 passed ========================
 ```
-Authentication, dual parser, token bucket rate limiter, SQLite işlemleri, watchlist, DM bildirimleri, yüzdesel alarmlar, cache tazeliği, genişletilmiş sembol kataloğu, hibrit canlı arama, borsa öneki ayrıştırması, piyasa beslemeleri (Binance/Yahoo), bot komutları ve tetikleyici motoru dahil **108 testin tamamı %100 yeşildir**.
+Authentication, dual parser, token bucket rate limiter, SQLite işlemleri, watchlist, DM bildirimleri, yüzdesel alarmlar, cache tazeliği, genişletilmiş sembol kataloğu, hibrit canlı arama, borsa öneki ayrıştırması, WARP proxy 503 failover/fallback koruması, piyasa beslemeleri (Binance/Yahoo), bot komutları ve tetikleyici motoru dahil **114 testin tamamı %100 yeşildir**.
 
 ---
 

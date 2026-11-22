@@ -1,12 +1,16 @@
 import asyncio
+from pathlib import Path
+import ssl
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
+import aiohttp
 import discord
 import pytest
 from fastapi.testclient import TestClient
+from yarl import URL
 from app.config import Settings, get_settings
 from app.database.db import AlertRecord
-from app.main import create_app
+from app.main import create_app, is_proxy_connection_error
 from app.providers.discord import DiscordBotNotificationProvider
 from app.routes.health import check_bot_health
 from tests.conftest import TEST_SECRET
@@ -659,5 +663,266 @@ async def test_discord_bot_notification_provider_skips_when_closed():
     result = await provider.send(payload)
     assert result is False
     mock_bot.get_channel.assert_not_called()
+
+
+# --- 6. WARP Proxy HTTP 503 Failover, Direct Fallback & Infrastructure Regression Tests ---
+
+def _make_proxy_503_error(url: str = "http://warp:1080") -> aiohttp.ClientHttpProxyError:
+    req = aiohttp.RequestInfo(
+        url=URL(url),
+        method="CONNECT",
+        headers={},
+        real_url=URL(url),
+    )
+    return aiohttp.ClientHttpProxyError(
+        request_info=req,
+        history=(),
+        status=503,
+        message="Service Unavailable",
+    )
+
+
+def test_settings_discord_proxy_list_parsing():
+    assert Settings(DISCORD_PROXY=None).discord_proxy_list == []
+    assert Settings(DISCORD_PROXY="   ").discord_proxy_list == []
+    assert Settings(DISCORD_PROXY="http://warp:1080").discord_proxy_list == ["http://warp:1080"]
+    assert Settings(
+        DISCORD_PROXY=" http://warp:1080 , http://warp2:1080, http://warp:1080 , "
+    ).discord_proxy_list == ["http://warp:1080", "http://warp2:1080"]
+
+
+def test_is_proxy_connection_error_classification():
+    assert is_proxy_connection_error(_make_proxy_503_error()) is True
+    assert is_proxy_connection_error(
+        RuntimeError("503, message='Service Unavailable', url='http://warp:1080'")
+    ) is True
+    assert is_proxy_connection_error(ValueError("unrelated error")) is False
+    assert is_proxy_connection_error(discord.errors.LoginFailure("bad token")) is False
+
+
+@pytest.mark.asyncio
+async def test_supervisor_proxy_503_failover_to_backup_proxy(monkeypatch, tmp_path):
+    """Regression: HTTP 503 from http://warp:1080 rotates to configured backup proxy."""
+    from app.main import lifespan
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "proxy_backup.db"))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "valid_token_abc_123")
+    monkeypatch.setenv("DISCORD_PROXY", "http://warp:1080,http://warp2:1080")
+    monkeypatch.setenv("DISCORD_PROXY_FALLBACK_DIRECT", "false")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "")
+    get_settings.cache_clear()
+
+    app = create_app()
+    seen_proxies = []
+    connected_event = asyncio.Event()
+    release_bot = asyncio.Event()
+
+    orig_wait_for = asyncio.wait_for
+
+    async def fast_wait_for(coro, timeout=None):
+        effective = min(timeout, 0.01) if timeout is not None and timeout >= 1.0 else timeout
+        return await orig_wait_for(coro, timeout=effective)
+
+    def make_bot(*args, **kwargs):
+        proxy = kwargs.get("proxy_override")
+        seen_proxies.append(proxy)
+        b = MagicMock()
+        b.is_closed.return_value = False
+
+        async def _close():
+            b.is_closed.return_value = True
+            if proxy != "http://warp:1080":
+                release_bot.set()
+
+        async def _start(token):
+            if proxy == "http://warp:1080":
+                raise _make_proxy_503_error(proxy)
+            connected_event.set()
+            await release_bot.wait()
+
+        b.close = AsyncMock(side_effect=_close)
+        b.start = AsyncMock(side_effect=_start)
+        return b
+
+    with patch("app.main.DiscordAlertBot", side_effect=make_bot), \
+         patch("app.main.asyncio.wait_for", side_effect=fast_wait_for), \
+         patch("app.market_data.binance.BinanceMarketFeed.start_stream", MagicMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.start_polling", MagicMock()), \
+         patch("app.market_data.binance.BinanceMarketFeed.stop", AsyncMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.stop", AsyncMock()):
+        async with lifespan(app):
+            await orig_wait_for(connected_event.wait(), timeout=2.0)
+            assert seen_proxies[:2] == ["http://warp:1080", "http://warp2:1080"]
+            assert app.state.discord_bot_active_proxy == "http://warp2:1080"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_proxy_503_direct_fallback_and_dpi_return(monkeypatch, tmp_path):
+    """Regression: Repeated WARP 503 probes direct connection, and returns to proxy if direct is DPI-blocked."""
+    from app.main import lifespan
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "proxy_direct_fb.db"))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "valid_token_abc_123")
+    monkeypatch.setenv("DISCORD_PROXY", "http://warp:1080")
+    monkeypatch.setenv("DISCORD_PROXY_FALLBACK_DIRECT", "true")
+    monkeypatch.setenv("DISCORD_PROXY_FAILOVER_THRESHOLD", "2")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "")
+    get_settings.cache_clear()
+
+    app = create_app()
+    seen_proxies = []
+    recovered_event = asyncio.Event()
+    release_bot = asyncio.Event()
+
+    orig_wait_for = asyncio.wait_for
+
+    async def fast_wait_for(coro, timeout=None):
+        effective = min(timeout, 0.01) if timeout is not None and timeout >= 1.0 else timeout
+        return await orig_wait_for(coro, timeout=effective)
+
+    def make_bot(*args, **kwargs):
+        proxy = kwargs.get("proxy_override")
+        attempt = len(seen_proxies) + 1
+        seen_proxies.append(proxy)
+        b = MagicMock()
+        b.is_closed.return_value = False
+
+        async def _close():
+            b.is_closed.return_value = True
+            if attempt >= 4:
+                release_bot.set()
+
+        async def _start(token):
+            if attempt in (1, 2):
+                # Primary WARP proxy returns HTTP 503 twice
+                raise _make_proxy_503_error("http://warp:1080")
+            if attempt == 3:
+                # Direct fallback probe blocked by ISP DPI
+                raise ssl.SSLCertVerificationError("ISP DPI block")
+            # Attempt 4: returned to http://warp:1080 after WARP came back up
+            recovered_event.set()
+            await release_bot.wait()
+
+        b.close = AsyncMock(side_effect=_close)
+        b.start = AsyncMock(side_effect=_start)
+        return b
+
+    with patch("app.main.DiscordAlertBot", side_effect=make_bot), \
+         patch("app.main.asyncio.wait_for", side_effect=fast_wait_for), \
+         patch("app.market_data.binance.BinanceMarketFeed.start_stream", MagicMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.start_polling", MagicMock()), \
+         patch("app.market_data.binance.BinanceMarketFeed.stop", AsyncMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.stop", AsyncMock()):
+        async with lifespan(app):
+            await orig_wait_for(recovered_event.wait(), timeout=2.0)
+            assert seen_proxies[:4] == [
+                "http://warp:1080",
+                "http://warp:1080",
+                None,
+                "http://warp:1080",
+            ]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_proxy_503_disabled_direct_fallback_and_clamped_backoff_diagnostics(
+    monkeypatch, tmp_path, caplog
+):
+    """Regression: Ensures backoff never prints 'step 5/4', respects disabled direct fallback, and exposes 503 in /live & /healthz."""
+    from app.main import lifespan
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "proxy_503_diag.db"))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "valid_token_abc_123")
+    monkeypatch.setenv("DISCORD_PROXY", "http://warp:1080")
+    monkeypatch.setenv("DISCORD_PROXY_FALLBACK_DIRECT", "false")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "")
+    get_settings.cache_clear()
+
+    app = create_app()
+    seen_proxies = []
+    sixth_attempt = asyncio.Event()
+    release_bot = asyncio.Event()
+
+    orig_wait_for = asyncio.wait_for
+
+    async def fast_wait_for(coro, timeout=None):
+        effective = min(timeout, 0.01) if timeout is not None and timeout >= 1.0 else timeout
+        return await orig_wait_for(coro, timeout=effective)
+
+    def make_bot(*args, **kwargs):
+        proxy = kwargs.get("proxy_override")
+        attempt = len(seen_proxies) + 1
+        seen_proxies.append(proxy)
+        b = MagicMock()
+        b.is_closed.return_value = False
+        b.is_ready.return_value = False
+
+        async def _close():
+            b.is_closed.return_value = True
+            if attempt > 5:
+                release_bot.set()
+
+        async def _start(token):
+            if attempt <= 5:
+                raise _make_proxy_503_error("http://warp:1080")
+            sixth_attempt.set()
+            await release_bot.wait()
+
+        b.close = AsyncMock(side_effect=_close)
+        b.start = AsyncMock(side_effect=_start)
+        return b
+
+    with caplog.at_level("WARNING", logger="tradingview_alerts"), \
+         patch("app.main.DiscordAlertBot", side_effect=make_bot), \
+         patch("app.main.asyncio.wait_for", side_effect=fast_wait_for), \
+         patch("app.market_data.binance.BinanceMarketFeed.start_stream", MagicMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.start_polling", MagicMock()), \
+         patch("app.market_data.binance.BinanceMarketFeed.stop", AsyncMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.stop", AsyncMock()):
+        async with lifespan(app):
+            await orig_wait_for(sixth_attempt.wait(), timeout=2.0)
+
+            # Direct fallback must NEVER be used when disabled
+            assert all(p == "http://warp:1080" for p in seen_proxies)
+
+            # Backoff step must remain clamped (never 'step 5/4')
+            assert "step 5/4" not in caplog.text
+            assert "step 4/4, attempt #5" in caplog.text
+
+            # Expire startup grace period and check /live + /healthz surface exact proxy 503 root cause
+            app.state.app_start_time = time.time() - 30.0
+            client = TestClient(app)
+
+            live_resp = client.get("/live")
+            assert live_resp.status_code == 503
+            live_details = live_resp.json()["details"]
+            assert "503" in live_details["last_error"]
+            assert live_details["active_proxy"] == "http://warp:1080"
+            assert live_details["proxy_failures"] >= 5
+
+            health_resp = client.get("/healthz")
+            assert health_resp.status_code == 503
+            health_bot = health_resp.json()["discord_bot"]
+            assert "ClientHttpProxyError" in health_bot["last_error"]
+            assert health_bot["active_proxy"] == "http://warp:1080"
+            assert health_bot["proxy_failures"] >= 5
+
+
+def test_docker_compose_warp_sidecar_prevents_503_regressions():
+    """Infrastructure regression guard: ensures WARP sidecar keeps TUN cgroup rules, healthcheck, and healthy dependency."""
+    compose_path = Path(__file__).resolve().parent.parent / "docker-compose.yml"
+    content = compose_path.read_text(encoding="utf-8")
+
+    # Mandatory for caomingjun/warp /dev/net/tun access on modern Docker/Linux kernels
+    assert "device_cgroup_rules:" in content
+    assert "c 10:200 rwm" in content
+    assert "NET_ADMIN" in content
+    assert "net.ipv6.conf.all.disable_ipv6=0" in content
+    assert "net.ipv4.conf.all.src_valid_mark=1" in content
+
+    # Mandatory healthcheck verifying actual WARP tunnel state (prevents proxy 503 race conditions)
+    assert "cloudflare.com/cdn-cgi/trace" in content
+    assert "warp=(on|plus)" in content
+    assert "condition: service_healthy" in content
+
 
 

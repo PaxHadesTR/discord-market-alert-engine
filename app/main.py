@@ -3,6 +3,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
+import aiohttp
 from fastapi import FastAPI
 import discord
 from app.bot.client import DiscordAlertBot
@@ -29,6 +30,25 @@ logging.getLogger("discord").setLevel(logging.INFO)
 logging.getLogger("discord.gateway").setLevel(logging.INFO)
 logging.getLogger("discord.client").setLevel(logging.INFO)
 logger = logging.getLogger("tradingview_alerts")
+
+
+def is_proxy_connection_error(exc: BaseException) -> bool:
+    """Return True if the exception represents an outbound proxy/tunnel failure (e.g. WARP HTTP 503)."""
+    if isinstance(
+        exc,
+        (
+            aiohttp.ClientHttpProxyError,
+            aiohttp.ClientProxyConnectionError,
+            aiohttp.ClientConnectorError,
+        ),
+    ):
+        return True
+    err_str = str(exc)
+    return (
+        "ClientHttpProxyError" in err_str
+        or "ClientProxyConnectionError" in err_str
+        or "503, message='Service Unavailable'" in err_str
+    )
 
 
 @asynccontextmanager
@@ -117,13 +137,50 @@ async def lifespan(app: FastAPI):
         async def _run_bot_supervisor():
             backoff_steps = [5.0, 10.0, 30.0, 60.0]
             backoff_idx = 0
+            attempt_num = 0
+            configured_proxies = settings.discord_proxy_list
+            failover_threshold = max(1, int(settings.DISCORD_PROXY_FAILOVER_THRESHOLD))
+            total_proxy_threshold = len(configured_proxies) * failover_threshold
+            proxy_idx = 0
+            consecutive_proxy_errors = 0
+
+            app.state.discord_bot_last_error = None
+            app.state.discord_bot_active_proxy = configured_proxies[0] if configured_proxies else None
+            app.state.discord_bot_proxy_failures = 0
 
             while not shutdown_event.is_set():
                 current_bot: Optional[DiscordAlertBot] = None
                 connect_start = time.time()
+
+                # Select outbound route: primary/backup proxy, or direct probe after repeated proxy failures
+                if not configured_proxies:
+                    selected_proxy: Optional[str] = None
+                    using_direct_fallback = False
+                elif settings.DISCORD_PROXY_FALLBACK_DIRECT and consecutive_proxy_errors >= total_proxy_threshold:
+                    selected_proxy = None
+                    using_direct_fallback = True
+                    # Reset counter so if direct connection is blocked (e.g. Turkey DPI), next cycle returns to proxy
+                    consecutive_proxy_errors = 0
+                    logger.warning(
+                        "Supervisor: All configured proxies (%s) failed %d consecutive times. "
+                        "Attempting temporary direct connection fallback...",
+                        ", ".join(configured_proxies),
+                        total_proxy_threshold,
+                    )
+                else:
+                    selected_proxy = configured_proxies[proxy_idx % len(configured_proxies)]
+                    using_direct_fallback = False
+
+                app.state.discord_bot_active_proxy = selected_proxy
+                fast_failover = False
+
                 try:
                     logger.info("Supervisor: Instantiating fresh DiscordAlertBot client...")
-                    current_bot = DiscordAlertBot(engine=alert_engine, settings=settings)
+                    current_bot = DiscordAlertBot(
+                        engine=alert_engine,
+                        settings=settings,
+                        proxy_override=selected_proxy,
+                    )
                     app.state.discord_bot = current_bot
 
                     # Atomically update bot instance in queue providers
@@ -134,17 +191,46 @@ async def lifespan(app: FastAPI):
                     logger.info("Supervisor: Connecting Discord Bot to Discord Gateway...")
                     await current_bot.start(token)
                     logger.warning("Supervisor: Discord Bot gateway session ended normally.")
+                    app.state.discord_bot_last_error = None
                 except asyncio.CancelledError:
                     logger.info("Supervisor: Discord Bot supervisor task cancelled.")
                     break
                 except (discord.errors.LoginFailure, discord.errors.PrivilegedIntentsRequired) as fatal_err:
+                    app.state.discord_bot_last_error = f"{type(fatal_err).__name__}: {fatal_err}"
                     logger.critical(
                         "Supervisor: FATAL Discord authentication/permission error: %s. Aborting supervisor to prevent API bans.",
                         fatal_err,
                     )
                     break
                 except Exception as bot_err:
-                    logger.error("Supervisor: Discord Bot gateway session terminated with error: %s", bot_err, exc_info=True)
+                    app.state.discord_bot_last_error = f"{type(bot_err).__name__}: {bot_err}"
+                    if selected_proxy is not None and is_proxy_connection_error(bot_err):
+                        consecutive_proxy_errors += 1
+                        app.state.discord_bot_proxy_failures = consecutive_proxy_errors
+                        proxy_idx += 1
+                        logger.error(
+                            "Supervisor: Outbound proxy '%s' failed (%s) [consecutive proxy errors: %d]. "
+                            "Verify WARP tunnel health (`docker exec warp warp-cli status` / `docker restart warp` "
+                            "and ensure `device_cgroup_rules: ['c 10:200 rwm']` is set).",
+                            selected_proxy,
+                            bot_err,
+                            consecutive_proxy_errors,
+                        )
+                        # Speed up failover when switching to a backup proxy or entering direct fallback
+                        if len(configured_proxies) > 1 or (
+                            settings.DISCORD_PROXY_FALLBACK_DIRECT
+                            and consecutive_proxy_errors >= total_proxy_threshold
+                        ):
+                            fast_failover = True
+                    elif using_direct_fallback:
+                        logger.warning(
+                            "Supervisor: Direct fallback connection also failed (%s). "
+                            "Returning to configured proxy '%s' on next cycle.",
+                            bot_err,
+                            configured_proxies[0],
+                        )
+                    else:
+                        logger.error("Supervisor: Discord Bot gateway session terminated with error: %s", bot_err, exc_info=True)
                 finally:
                     if current_bot and not current_bot.is_closed():
                         try:
@@ -155,18 +241,25 @@ async def lifespan(app: FastAPI):
                 if shutdown_event.is_set():
                     break
 
-                # If connection lasted > 60s, reset backoff progression
+                # If connection lasted > 60s, reset backoff and proxy error counters
                 if time.time() - connect_start > 60.0:
                     backoff_idx = 0
+                    consecutive_proxy_errors = 0
+                    app.state.discord_bot_proxy_failures = 0
 
-                delay = backoff_steps[min(backoff_idx, len(backoff_steps) - 1)]
-                backoff_idx += 1
+                step_num = min(backoff_idx + 1, len(backoff_steps))
+                delay = backoff_steps[step_num - 1]
+                if fast_failover:
+                    delay = min(delay, 5.0)
+                backoff_idx = min(backoff_idx + 1, len(backoff_steps) - 1)
+                attempt_num += 1
 
                 logger.warning(
-                    "Supervisor: Discord Bot disconnected. Attempting reconnection in %.0fs (step %d/%d)...",
+                    "Supervisor: Discord Bot disconnected. Attempting reconnection in %.0fs (step %d/%d, attempt #%d)...",
                     delay,
-                    backoff_idx,
+                    step_num,
                     len(backoff_steps),
+                    attempt_num,
                 )
                 try:
                     await asyncio.wait_for(shutdown_event.wait(), timeout=delay)

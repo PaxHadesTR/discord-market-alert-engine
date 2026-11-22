@@ -71,13 +71,23 @@ def check_bot_health(request: Request) -> Tuple[bool, str, Dict[str, Any]]:
     # 4. Grace period expired and bot is not ready / closed / None
     is_closed = bot.is_closed() if bot else True
     reason = "Bot instance is None" if bot is None else ("Bot is closed" if is_closed else "Bot is not ready")
-    return False, "offline", {
+    details: Dict[str, Any] = {
         "configured": True,
         "supervisor_alive": True,
         "ready": False,
         "closed": is_closed,
         "reason": reason,
     }
+    last_error = getattr(request.app.state, "discord_bot_last_error", None)
+    if last_error:
+        details["last_error"] = last_error
+    active_proxy = getattr(request.app.state, "discord_bot_active_proxy", None)
+    if active_proxy is not None:
+        details["active_proxy"] = active_proxy
+    proxy_failures = getattr(request.app.state, "discord_bot_proxy_failures", 0)
+    if proxy_failures:
+        details["proxy_failures"] = proxy_failures
+    return False, "offline", details
 
 
 @router.get("/healthz")

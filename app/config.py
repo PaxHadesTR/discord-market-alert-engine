@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Optional
+from typing import List, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,8 +29,11 @@ class Settings(BaseSettings):
     # Discord Bot Configuration (for interactive Slash Commands and autonomous alerts)
     DISCORD_BOT_TOKEN: Optional[str] = None
     DISCORD_ALERT_CHANNEL_ID: Optional[int] = None
-    # Optional HTTP/SOCKS5 proxy for connecting to Discord from blocked regions (e.g. Turkey)
+    # Optional HTTP/SOCKS5 proxy (or comma-separated failover list) for connecting to Discord from blocked regions
     DISCORD_PROXY: Optional[str] = None
+    # When all configured proxies fail consecutively (e.g. WARP 503), probe direct connection before rotating back
+    DISCORD_PROXY_FALLBACK_DIRECT: bool = True
+    DISCORD_PROXY_FAILOVER_THRESHOLD: int = 2
 
     # Autonomous Alert Engine & Limits
     SQLITE_DB_PATH: str = "./data/alerts.db"
@@ -60,6 +63,19 @@ class Settings(BaseSettings):
             "false",
         }
         return bool(token and token.lower() not in dummy_tokens)
+
+    @property
+    def discord_proxy_list(self) -> List[str]:
+        """Parse comma-separated DISCORD_PROXY values into an ordered, deduplicated list."""
+        raw = (self.DISCORD_PROXY or "").strip()
+        if not raw:
+            return []
+        proxies: List[str] = []
+        for part in raw.split(","):
+            cleaned = part.strip().strip('"').strip("'")
+            if cleaned and cleaned not in proxies:
+                proxies.append(cleaned)
+        return proxies
 
 
 @lru_cache()

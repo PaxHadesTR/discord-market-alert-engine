@@ -13,7 +13,8 @@ services:
     env_file:
       - .env
     depends_on:
-      - warp
+      warp:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/live')\""]
       interval: 30s
@@ -31,6 +32,8 @@ services:
     image: caomingjun/warp:latest
     container_name: warp_proxy
     restart: unless-stopped
+    device_cgroup_rules:
+      - 'c 10:200 rwm'
     cap_add:
       - NET_ADMIN
       - MKNOD
@@ -39,9 +42,15 @@ services:
       - net.ipv6.conf.all.disable_ipv6=0
       - net.ipv4.conf.all.src_valid_mark=1
     environment:
-      - WARP_SLEEP=5
+      - WARP_SLEEP=8
     volumes:
       - warp_data:/var/lib/cloudflare-warp
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 5 -x http://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -Eq 'warp=(on|plus)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     logging:
       driver: "json-file"
       options:

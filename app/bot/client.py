@@ -514,12 +514,27 @@ class HelpView(discord.ui.View):
 _commands_synced_globally: bool = False
 
 
+_UNSET = object()
+
+
 class DiscordAlertBot(commands.Bot):
     """Discord Bot implementation handling Slash Commands, Autocomplete, Watchlist, and Notifications."""
 
-    def __init__(self, engine: AutonomousAlertEngine, settings: Settings):
+    def __init__(
+        self,
+        engine: AutonomousAlertEngine,
+        settings: Settings,
+        proxy_override: object = _UNSET,
+    ):
         intents = discord.Intents.default()
-        proxy_url = (settings.DISCORD_PROXY or "").strip() or None
+        if proxy_override is _UNSET:
+            proxy_list = getattr(settings, "discord_proxy_list", None)
+            if proxy_list:
+                proxy_url = proxy_list[0]
+            else:
+                proxy_url = (settings.DISCORD_PROXY or "").strip() or None
+        else:
+            proxy_url = (str(proxy_override).strip() or None) if proxy_override is not None else None
         super().__init__(
             command_prefix="!",
             intents=intents,
@@ -528,12 +543,15 @@ class DiscordAlertBot(commands.Bot):
         )
         self.engine = engine
         self.settings = settings
+        self.active_proxy = proxy_url
         self.start_time = time.time()
         self.engine.trigger_callback = self.dispatch_alert_notification
         logging.getLogger("discord.gateway").setLevel(logging.INFO)
         logging.getLogger("discord.client").setLevel(logging.INFO)
         if proxy_url:
             logger.info("Discord Bot configured with outbound proxy: %s", proxy_url)
+        elif proxy_override is None and getattr(settings, "discord_proxy_list", []):
+            logger.info("Discord Bot attempting direct connection (proxy fallback mode).")
 
     async def setup_hook(self) -> None:
         """Register persistent dynamic items, slash command groups, and sync tree."""
