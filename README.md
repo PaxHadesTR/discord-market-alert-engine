@@ -37,12 +37,13 @@ docker run -d \
   -v warp_data:/var/lib/cloudflare-warp \
   caomingjun/warp:latest
 ```
-Ardından Coolify'da **Environment Variables** kısmına şunu ekleyin (birden fazla yedek proxy için virgülle ayırabilirsiniz):
+Ardından Coolify'da **Environment Variables** kısmına şunu ekleyin (Türkiye lokasyonlu sunucularda `DISCORD_PROXY_FALLBACK_DIRECT=false` olarak bırakmanız yeterlidir; birden fazla yedek proxy için `DISCORD_PROXY` değerini virgülle ayırabilirsiniz):
 ```env
 DISCORD_PROXY=http://warp:1080
-DISCORD_PROXY_FALLBACK_DIRECT=true
+DISCORD_PROXY_FALLBACK_DIRECT=false
+DISCORD_PROXY_FAILOVER_THRESHOLD=2
 ```
-Konteyneri **Restart** ettiğinizde bot engeli tamamen aşarak Discord'a bağlanacaktır.
+Konteyneri **Restart** ettiğinizde bot engeli tamamen aşarak Discord'a bağlanacaktır. WARP tüneli anlık kopsa bile supervisor döngüsü arka planda kendi kendini toparlayıp otomatik olarak yeniden bağlanır.
 
 > **💡 İpucu (Proxy `503 Service Unavailable` Durum Kontrolü):**
 > `http://warp:1080` üzerinden `503 Service Unavailable` hatası alırsanız, `warp` konteyneri içindeki Cloudflare tüneli (`warp-svc`) kopmuştur veya `/dev/net/tun` izni eksiktir:
@@ -165,26 +166,53 @@ TradingView grafik veya Pine Script stratejilerinizden botunuza sinyal gönderme
 4. **OAuth2 -> URL Generator** kısmında `bot` ve `applications.commands` seçin. İzin olarak `Send Messages`, `Embed Links`, `Attach Files`, `Read Message History` verin.
 5. Üretilen davet linkiyle botu sunucunuza ekleyin.
 
-### 2. Coolify Ortam Değişkenleri (.env)
-Coolify üzerinde aşağıdaki değişkenleri tanımlayın:
+### 2. Coolify Ortam Değişkenleri (.env) — Tek Seferlik Tam Yapılandırma
+Aşağıdaki bloğu Coolify **Environment Variables** (veya `.env`) içerisine tek seferde yapıştırıp yalnızca token/şifre alanlarını doldurmanız yeterlidir; sonradan ek bir ayar değişikliği yapmanız gerekmez:
 
 ```env
-# Bot ve Kanal Ayarları
+# === ZORUNLU ALANLAR (Sadece bunları kendi bilgilerinizle değiştirin) ===
 DISCORD_BOT_TOKEN=buraya_bot_tokeniniz
 DISCORD_ALERT_CHANNEL_ID=alarmlarin_duyurulacagi_kanal_id
-DISCORD_PROXY=http://warp:1080
+# TradingView Webhook kullanacaksanız güçlü bir gizli anahtar belirleyin (fail-closed)
+WEBHOOK_SECRET=buraya_guclu_bir_sifre_veya_token
 
-# Sistem ve Kullanıcı Kotaları
-MAX_ACTIVE_ALERTS=100
+# === PROXY & BAĞLANTI DAYANIKLILIĞI (Türkiye / BTK Engeli İçin Önerilen) ===
+# Türkiye dışı (engelsiz Avrupa/ABD) VPS kullanıyorsanız DISCORD_PROXY satırını boş bırakabilirsiniz.
+DISCORD_PROXY=http://warp:1080
+# Türkiye sunucularında 'false' önerilir (boşuna engelli direkt SSL denemesi yapmaz, WARP'ı bekler).
+# Engelsiz VPS'lerde WARP çökünce direkt bağlantıya geçmesi için 'true' yapabilirsiniz.
+DISCORD_PROXY_FALLBACK_DIRECT=false
+DISCORD_PROXY_FAILOVER_THRESHOLD=2
+
+# === SİSTEM, KOTA VE PERFORMANS (Varsayılan Hazır Değerler) ===
+MAX_ACTIVE_ALERTS=250
 MAX_USER_ACTIVE_ALERTS=25
 ALERT_EXPIRY_DAYS=180
+YAHOO_POLL_INTERVAL_SECONDS=20.0
 CACHE_TTL_SECONDS=20.0
+RATE_LIMIT_PER_SECOND=2.0
+MAX_QUEUE_CAPACITY=500
+HTTP_TIMEOUT_SECONDS=10.0
 SQLITE_DB_PATH=/app/data/alerts.db
+LOG_LEVEL=INFO
 
-# TradingView Webhook Ayarları (Webhook uç noktası için güçlü bir değer zorunludur — fail-closed)
-WEBHOOK_SECRET=buraya_guclu_bir_sifre_veya_token
+# === İSTEĞE BAĞLI: TRADINGVIEW DOĞRUDAN WEBHOOK ===
 # DISCORD_WEBHOOK_URL boş bırakılırsa, TradingView sinyalleri bot üzerinden DISCORD_ALERT_CHANNEL_ID'ye gönderilir!
+# DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/id/token
 ```
+
+| Değişken | Ne İşe Yarar? | Önerilen Değer |
+| :--- | :--- | :--- |
+| `DISCORD_BOT_TOKEN` | Discord Bot giriş anahtarı | *(Zorunlu)* |
+| `DISCORD_ALERT_CHANNEL_ID` | Alarmların düşeceği varsayılan kanal ID'si | *(Zorunlu)* |
+| `WEBHOOK_SECRET` | `/webhook/{secret}` güvenlik doğrulaması | *(Güçlü rastgele metin)* |
+| `DISCORD_PROXY` | Çıkış proxy adresi (virgülle yedekli liste destekler) | `http://warp:1080` *(TR)* / boş *(EU/US)* |
+| `DISCORD_PROXY_FALLBACK_DIRECT` | Proxy 503 verince direkt bağlantı denesin mi? | `false` *(TR)* / `true` *(EU/US)* |
+| `DISCORD_PROXY_FAILOVER_THRESHOLD` | Yedek/fallback öncesi ardışık proxy hata eşiği | `2` |
+| `MAX_ACTIVE_ALERTS` / `MAX_USER_ACTIVE_ALERTS` | Sistem geneli ve kullanıcı başı aktif alarm kotası | `250` / `25` |
+| `ALERT_EXPIRY_DAYS` | Tetiklenmeyen eski alarmların otomatik temizlenme süresi | `180` |
+| `YAHOO_POLL_INTERVAL_SECONDS` / `CACHE_TTL_SECONDS` | Hisse/Emtia/Döviz tarama ve önbellek tazelik süresi (sn) | `20.0` / `20.0` |
+| `SQLITE_DB_PATH` | Kalıcı veritabanı yolu (`/app/data` volume'u ile eşleşmeli) | `/app/data/alerts.db` |
 
 ---
 
