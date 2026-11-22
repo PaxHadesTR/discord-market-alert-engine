@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import ssl
 import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -33,13 +34,23 @@ logger = logging.getLogger("tradingview_alerts")
 
 
 def is_proxy_connection_error(exc: BaseException) -> bool:
-    """Return True if the exception represents an outbound proxy/tunnel failure (e.g. WARP HTTP 503)."""
+    """Return True if the exception represents an outbound proxy/tunnel/transport failure.
+
+    Covers HTTP 503 from WARP/gost as well as DPI TCP resets, TLS errors, or timeouts
+    through proxies like SpoofDPI so multi-proxy failover rotates immediately.
+    """
     if isinstance(
         exc,
         (
             aiohttp.ClientHttpProxyError,
             aiohttp.ClientProxyConnectionError,
             aiohttp.ClientConnectorError,
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ClientOSError,
+            asyncio.TimeoutError,
+            TimeoutError,
+            ConnectionError,
+            ssl.SSLError,
         ),
     ):
         return True
@@ -208,13 +219,18 @@ async def lifespan(app: FastAPI):
                         consecutive_proxy_errors += 1
                         app.state.discord_bot_proxy_failures = consecutive_proxy_errors
                         proxy_idx += 1
+                        next_proxy = configured_proxies[proxy_idx % len(configured_proxies)]
+                        rotate_hint = (
+                            f" Rotating to backup proxy '{next_proxy}'."
+                            if len(configured_proxies) > 1 and next_proxy != selected_proxy
+                            else " Verify proxy container health (`docker logs spoof-dpi` / `docker exec warp warp-cli status`)."
+                        )
                         logger.error(
-                            "Supervisor: Outbound proxy '%s' failed (%s) [consecutive proxy errors: %d]. "
-                            "Verify WARP tunnel health (`docker exec warp warp-cli status` / `docker restart warp` "
-                            "and ensure `device_cgroup_rules: ['c 10:200 rwm']` is set).",
+                            "Supervisor: Outbound proxy '%s' failed (%s) [consecutive proxy errors: %d].%s",
                             selected_proxy,
                             bot_err,
                             consecutive_proxy_errors,
+                            rotate_hint,
                         )
                         # Speed up failover when switching to a backup proxy or entering direct fallback
                         if len(configured_proxies) > 1 or (

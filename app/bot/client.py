@@ -583,10 +583,11 @@ class DiscordAlertBot(commands.Bot):
             is_proxy_err = "503" in err_str or "ClientHttpProxyError" in err_str or "Proxy" in err_str or "Cannot connect to host" in err_str
 
             if is_proxy_err:
+                proxy_label = self.active_proxy or "proxy"
                 msg = (
                     "⚠️ **Geçici Proxy Bağlantı Hatası (503):**\n"
-                    "> Discord proxy bağlantısında (`http://warp:1080`) anlık bir rota yenilenmesi veya kesinti yaşandı.\n"
-                    "> Lütfen **5-10 saniye bekleyip komutu tekrar deneyin**. Sorun devam ederse sunucudaki `warp` konteynerini kontrol edin."
+                    f"> Discord proxy bağlantısında (`{proxy_label}`) anlık bir rota yenilenmesi veya kesinti yaşandı.\n"
+                    "> Lütfen **5-10 saniye bekleyip komutu tekrar deneyin**. Sorun devam ederse sunucudaki `spoof-dpi` / `warp` konteynerlerini kontrol edin."
                 )
             else:
                 msg = f"⚠️ Komut işlenirken bir hata oluştu: {error}"

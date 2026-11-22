@@ -1,7 +1,7 @@
 # Project Mesh Dashboard: Tradingview Price Alert Notification
 
 **Current Execution Mode**: `PRODUCTION_READY` (Autonomous Multi-Market Discord Alert & Webhook Engine)  
-**System Health**: 100% GREEN (114/114 Tests Passing)  
+**System Health**: 100% GREEN (115/115 Tests Passing)  
 **Target Environment**: Coolify (Docker / Docker Compose), Python 3.12-slim container  
 
 ---
@@ -30,8 +30,8 @@
 - [x] Alert notification delivery rollback (`reset_alert_to_active`) preventing lost alerts during bot reconnection cycles (`app/database/db.py`, `app/services/alert_engine.py`)
 - [x] Global slash command sync deduplication across reconnect loops preventing 200/day Discord rate limiting (`app/bot/client.py`)
 - [x] Fatal auth failure handling (`LoginFailure`, `PrivilegedIntentsRequired`) aborting supervisor loop to prevent Discord IP bans (`app/main.py`)
-- [x] WARP proxy HTTP 503 resilience: `device_cgroup_rules` (`/dev/net/tun`), tunnel healthcheck (`warp=on|plus`), `condition: service_healthy`, multi-proxy failover & direct fallback, clamped backoff logging, and `/live`/`/healthz` proxy diagnostics (`docker-compose.yml`, `app/main.py`, `app/routes/health.py`)
-- [x] Full adversarial test suite: 114 automated unit & integration tests (100% GREEN)
+- [x] Dual-proxy Turkey DPI bypass stack: `spoof-dpi` primary + hardened `warp` backup (`device_cgroup_rules`, `WARP_ENABLE_NAT=1`, `ip_forward`, tunnel healthcheck) + `autoheal` sidecar + full transport/DPI error failover (`docker-compose.yml`, `app/main.py`, `app/routes/health.py`)
+- [x] Full adversarial test suite: 115 automated unit & integration tests (100% GREEN)
 - [x] Comprehensive documentation (`README.md`, `.env.example`, `DASHBOARD.md`, `DECISIONS.md`, `ASSUMPTIONS.md`)
 
 ### In Progress

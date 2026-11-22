@@ -696,6 +696,11 @@ def test_is_proxy_connection_error_classification():
     assert is_proxy_connection_error(
         RuntimeError("503, message='Service Unavailable', url='http://warp:1080'")
     ) is True
+    # DPI TCP reset, disconnect, timeout, and TLS errors through SpoofDPI must also trigger failover
+    assert is_proxy_connection_error(ConnectionResetError("ISP DPI RST")) is True
+    assert is_proxy_connection_error(aiohttp.ServerDisconnectedError("proxy closed")) is True
+    assert is_proxy_connection_error(asyncio.TimeoutError("handshake timed out")) is True
+    assert is_proxy_connection_error(ssl.SSLCertVerificationError("self-signed")) is True
     assert is_proxy_connection_error(ValueError("unrelated error")) is False
     assert is_proxy_connection_error(discord.errors.LoginFailure("bad token")) is False
 
@@ -907,22 +912,89 @@ async def test_supervisor_proxy_503_disabled_direct_fallback_and_clamped_backoff
             assert health_bot["proxy_failures"] >= 5
 
 
+@pytest.mark.asyncio
+async def test_supervisor_spoofdpi_dpi_reset_failover_to_warp(monkeypatch, tmp_path):
+    """Regression: Strict ISP TCP reset / timeout through SpoofDPI rotates immediately to backup WARP proxy."""
+    from app.main import lifespan
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "spoofdpi_failover.db"))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "valid_token_abc_123")
+    monkeypatch.setenv("DISCORD_PROXY", "http://spoof-dpi:8080,http://warp:1080")
+    monkeypatch.setenv("DISCORD_PROXY_FALLBACK_DIRECT", "false")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "")
+    get_settings.cache_clear()
+
+    app = create_app()
+    seen_proxies = []
+    connected_event = asyncio.Event()
+    release_bot = asyncio.Event()
+
+    orig_wait_for = asyncio.wait_for
+
+    async def fast_wait_for(coro, timeout=None):
+        effective = min(timeout, 0.01) if timeout is not None and timeout >= 1.0 else timeout
+        return await orig_wait_for(coro, timeout=effective)
+
+    def make_bot(*args, **kwargs):
+        proxy = kwargs.get("proxy_override")
+        seen_proxies.append(proxy)
+        b = MagicMock()
+        b.is_closed.return_value = False
+
+        async def _close():
+            b.is_closed.return_value = True
+            if proxy == "http://warp:1080":
+                release_bot.set()
+
+        async def _start(token):
+            if proxy == "http://spoof-dpi:8080":
+                # Simulate strict ISP DPI TCP RST after CONNECT through SpoofDPI
+                raise ConnectionResetError("Connection reset by peer (ISP DPI)")
+            connected_event.set()
+            await release_bot.wait()
+
+        b.close = AsyncMock(side_effect=_close)
+        b.start = AsyncMock(side_effect=_start)
+        return b
+
+    with patch("app.main.DiscordAlertBot", side_effect=make_bot), \
+         patch("app.main.asyncio.wait_for", side_effect=fast_wait_for), \
+         patch("app.market_data.binance.BinanceMarketFeed.start_stream", MagicMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.start_polling", MagicMock()), \
+         patch("app.market_data.binance.BinanceMarketFeed.stop", AsyncMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.stop", AsyncMock()):
+        async with lifespan(app):
+            await orig_wait_for(connected_event.wait(), timeout=2.0)
+            assert seen_proxies[:2] == ["http://spoof-dpi:8080", "http://warp:1080"]
+            assert app.state.discord_bot_active_proxy == "http://warp:1080"
+
+
 def test_docker_compose_warp_sidecar_prevents_503_regressions():
-    """Infrastructure regression guard: ensures WARP sidecar keeps TUN cgroup rules, healthcheck, and healthy dependency."""
+    """Infrastructure regression guard: ensures SpoofDPI + hardened WARP + autoheal stay configured."""
     compose_path = Path(__file__).resolve().parent.parent / "docker-compose.yml"
     content = compose_path.read_text(encoding="utf-8")
 
-    # Mandatory for caomingjun/warp /dev/net/tun access on modern Docker/Linux kernels
+    # Primary zero-tunnel DPI bypass proxy
+    assert "spoof-dpi:" in content
+    assert "ghcr.io/unmedius/spoof-dpi:latest" in content
+
+    # Mandatory for caomingjun/warp /dev/net/tun access & forwarding on modern Docker/Linux kernels
     assert "device_cgroup_rules:" in content
     assert "c 10:200 rwm" in content
     assert "NET_ADMIN" in content
     assert "net.ipv6.conf.all.disable_ipv6=0" in content
     assert "net.ipv4.conf.all.src_valid_mark=1" in content
+    assert "net.ipv4.ip_forward=1" in content
+    assert "WARP_ENABLE_NAT=1" in content
+    assert "autoheal=true" in content
 
     # Mandatory healthcheck verifying actual WARP tunnel state (prevents proxy 503 race conditions)
     assert "cloudflare.com/cdn-cgi/trace" in content
     assert "warp=(on|plus)" in content
     assert "condition: service_healthy" in content
+
+    # Autoheal sidecar restarts unhealthy warp containers automatically
+    assert "willfarrell/autoheal:latest" in content
 
 
 

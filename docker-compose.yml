@@ -13,6 +13,8 @@ services:
     env_file:
       - .env
     depends_on:
+      spoof-dpi:
+        condition: service_started
       warp:
         condition: service_healthy
     healthcheck:
@@ -27,11 +29,27 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # Cloudflare WARP Proxy Sidecar (Essential for regions where Discord is blocked, e.g., Turkey / BTK block)
+  # Primary Zero-Tunnel DPI Bypass HTTP Proxy (Turkey / BTK SNI bypass, ~10MB RAM, no VPN drops)
+  spoof-dpi:
+    image: ghcr.io/unmedius/spoof-dpi:latest
+    container_name: spoof_dpi
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # Backup Cloudflare WARP Proxy Sidecar (Automatic failover if ISP tightens DPI rules)
   warp:
     image: caomingjun/warp:latest
     container_name: warp_proxy
     restart: unless-stopped
+    labels:
+      - "autoheal=true"
     device_cgroup_rules:
       - 'c 10:200 rwm'
     cap_add:
@@ -41,8 +59,14 @@ services:
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=0
       - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     environment:
       - WARP_SLEEP=8
+      - WARP_ENABLE_NAT=1
     volumes:
       - warp_data:/var/lib/cloudflare-warp
     healthcheck:
@@ -50,11 +74,27 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 20s
     logging:
       driver: "json-file"
       options:
         max-size: "5m"
+        max-file: "2"
+
+  # Automatic self-healer that restarts unhealthy warp containers (Docker does not auto-restart unhealthy containers)
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: warp_autoheal
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=15
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "2m"
         max-file: "2"
 
 volumes:

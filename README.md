@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-114%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-115%20passed-brightgreen.svg)](tests/)
 
 A high-performance, self-hosted, autonomous price monitoring and notification service designed to bypass TradingView free-tier alert limits and provide institutional-grade alerts on your own infrastructure.
 
@@ -11,52 +11,87 @@ Run your own alert service 24/7 on **Coolify** or Docker. Set alerts for **Crypt
 
 ---
 
-## 🇹🇷 Türkiye İçin Kurulum & Discord Erişim Engeli Çözümü (Cloudflare WARP)
+## 🇹🇷 Türkiye İçin Kurulum & Discord Erişim Engeli Çözümü (SpoofDPI + Cloudflare WARP Çift Proxy)
 
 Türkiye'de BTK ve mahkeme kararıyla **Discord'a erişim engeli** uygulandığından, Türkiye lokasyonlu sunuculardan (veya yerel WSL/Docker kurulumlarından) `discord.com`'a bağlanmaya çalışıldığında internet servis sağlayıcıların (Superonline, TTNET vb.) DPI engellemesi nedeniyle `SSLCertVerificationError` hatası alınır.
 
-Bu projede Türkiye'deki kullanıcıların ek hiçbir ücret ödemeden ve VPN kurmak zorunda kalmadan Discord botunu çalıştırabilmesi için **Cloudflare WARP Sidecar / Proxy** desteği entegre edilmiştir.
+Bu projede Türkiye'deki kullanıcıların tek başına WARP tünel kopmaları yaşamadan, ek hiçbir ücret ödemeden ve VPN kurmadan 7/24 kesintisiz çalışabilmesi için **Çift Proxy Failover (`SpoofDPI` birincil + `Cloudflare WARP` yedek + `Autoheal`)** mimarisi entegre edilmiştir:
+- **Birincil (`spoof-dpi`):** VPN/UDP tüneli kurmaz (~10 MB RAM, düşük ping, tünel kopması sıfır). Yalnızca TLS `ClientHello` paketini parçalayarak BTK SNI/DPI engelini doğrudan geçer.
+- **Yedek (`warp` + `autoheal`):** ISS kuralları sıkılaşıp `spoof-dpi` bağlantı hatası verirse bot **5 saniye içinde otomatik `http://warp:1080` yedeğine** geçer; `autoheal` donan `warp` konteynerini otomatik yeniden başlatır.
 
 ### Nasıl Uygulanır?
 
-#### 1. Coolify ile Kullanıyorsanız (Önerilen Sağlam Kurulum)
-Sunucunuzun terminalinde (veya WSL içinde) Cloudflare WARP konteynerini gerekli çekirdek ağ yetkileri ve kalıcı oturum hacmiyle başlatın:
+#### 1. Coolify ile Kullanıyorsanız (Önerilen Çift Proxy Kurulumu)
+Sunucunuzun terminalinde (veya WSL içinde) `spoof-dpi`, sertleştirilmiş `warp` ve `autoheal` konteynerlerini `coolify` ağında başlatın:
 ```bash
+# 1) Birincil: SpoofDPI (Kopmasız HTTP DPI Bypass Proxy)
+docker rm -f spoof-dpi
+docker run -d \
+  --name spoof-dpi \
+  --restart always \
+  --network coolify \
+  --dns 1.1.1.1 \
+  --dns 8.8.8.8 \
+  ghcr.io/unmedius/spoof-dpi:latest
+
+# 2) Yedek: Sertleştirilmiş Cloudflare WARP Proxy (autoheal etiketli)
 docker rm -f warp
 docker run -d \
   --name warp \
   --restart always \
   --network coolify \
+  --label autoheal=true \
   --device-cgroup-rule='c 10:200 rwm' \
   --cap-add NET_ADMIN \
   --cap-add MKNOD \
   --cap-add AUDIT_WRITE \
   --sysctl net.ipv6.conf.all.disable_ipv6=0 \
   --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+  --sysctl net.ipv4.ip_forward=1 \
+  --sysctl net.ipv6.conf.all.forwarding=1 \
+  --dns 1.1.1.1 \
+  --dns 8.8.8.8 \
   -e WARP_SLEEP=8 \
+  -e WARP_ENABLE_NAT=1 \
   -v warp_data:/var/lib/cloudflare-warp \
+  --health-cmd="curl -fsS --max-time 5 -x http://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -Eq 'warp=(on|plus)'" \
+  --health-interval=30s \
+  --health-timeout=10s \
+  --health-retries=3 \
+  --health-start-period=20s \
   caomingjun/warp:latest
+
+# 3) Otomatik Kurtarıcı: unhealthy olan warp konteynerini anında restart eder
+docker rm -f autoheal
+docker run -d \
+  --name autoheal \
+  --restart always \
+  -e AUTOHEAL_CONTAINER_LABEL=autoheal \
+  -e AUTOHEAL_INTERVAL=15 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  willfarrell/autoheal:latest
 ```
-Ardından Coolify'da **Environment Variables** kısmına şunu ekleyin (Türkiye lokasyonlu sunucularda `DISCORD_PROXY_FALLBACK_DIRECT=false` olarak bırakmanız yeterlidir; birden fazla yedek proxy için `DISCORD_PROXY` değerini virgülle ayırabilirsiniz):
+*(İsteğe bağlı — Türkiye ISS'lerinde WARP yedeğini MASQUE protokolüne almak için 10sn sonra: `docker exec warp warp-cli tunnel protocol set MASQUE && docker exec warp warp-cli disconnect && docker exec warp warp-cli connect`)*
+
+Ardından Coolify'da **Environment Variables** kısmına şunu ekleyin:
 ```env
-DISCORD_PROXY=http://warp:1080
+DISCORD_PROXY=http://spoof-dpi:8080,http://warp:1080
 DISCORD_PROXY_FALLBACK_DIRECT=false
 DISCORD_PROXY_FAILOVER_THRESHOLD=2
 ```
-Konteyneri **Restart** ettiğinizde bot engeli tamamen aşarak Discord'a bağlanacaktır. WARP tüneli anlık kopsa bile supervisor döngüsü arka planda kendi kendini toparlayıp otomatik olarak yeniden bağlanır.
+Konteyneri **Restart** ettiğinizde bot birincil olarak `spoof-dpi` üzerinden bağlanır; herhangi bir kopma/reset durumunda 5 saniyede otomatik `warp` yedeğine geçer.
 
-> **💡 İpucu (Proxy `503 Service Unavailable` Durum Kontrolü):**
-> `http://warp:1080` üzerinden `503 Service Unavailable` hatası alırsanız, `warp` konteyneri içindeki Cloudflare tüneli (`warp-svc`) kopmuştur veya `/dev/net/tun` izni eksiktir:
-> 1. Tünel durumunu doğrulayın: `docker exec warp curl -s -x http://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep warp=` (`warp=on` veya `warp=plus` yazmalıdır).
-> 2. Bağlantı kopmuşsa yeniden bağlayın/yeniden başlatın: `docker exec warp warp-cli connect` veya `docker restart warp`.
-> 3. Sorun devam ederse bozuk oturum verisini sıfırlayın: `docker rm -f warp && docker volume rm warp_data` ve yukarıdaki `--device-cgroup-rule='c 10:200 rwm'` bayraklı komutla yeniden başlatın.
+> **💡 İpucu (Proxy Test & `503 Service Unavailable` Kontrolü):**
+> - SpoofDPI testi (`HTTP/2 200` dönmeli): `docker exec warp curl -sI --max-time 8 -x http://spoof-dpi:8080 https://discord.com/api/v10/gateway | head -n 1`
+> - WARP tünel testi (`warp=on` veya `warp=plus` yazmalı): `docker exec warp curl -s --max-time 8 -x http://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep warp=`
+> - WARP tamamen kilitlenirse sıfırlama: `docker rm -f warp && docker volume rm warp_data` ve yukarıdaki `warp` komutuyla yeniden başlatın.
 
 #### 2. Standart Docker Compose ile Kullanıyorsanız
-Proje kökündeki `docker-compose.yml` dosyasına `warp` servisi zaten eklenmiştir:
+Proje kökündeki `docker-compose.yml` dosyasına `spoof-dpi`, `warp` ve `autoheal` servislerinin tamamı önceden tanımlanmıştır:
 ```bash
 docker compose up -d --build
 ```
-Konteynerler ayağa kalktığında bot otomatik olarak `warp` proxy'si üzerinden Discord'a bağlanır.
+Konteynerler ayağa kalktığında bot otomatik olarak çift proxy failover (`http://spoof-dpi:8080,http://warp:1080`) üzerinden Discord'a bağlanır.
 
 ---
 
@@ -173,11 +208,12 @@ Uygulamanın çalışması için **zorunlu olan tek değişken `DISCORD_BOT_TOKE
 # === ZORUNLU ALAN (Sadece bunu kendi bot tokeninizle değiştirin) ===
 DISCORD_BOT_TOKEN=buraya_bot_tokeniniz
 
-# === PROXY & BAĞLANTI DAYANIKLILIĞI (Türkiye / BTK Engeli İçin Önerilen) ===
+# === PROXY & BAĞLANTI DAYANIKLILIĞI (Türkiye / BTK Engeli İçin Önerilen Çift Proxy) ===
 # Türkiye dışı (engelsiz Avrupa/ABD) VPS kullanıyorsanız DISCORD_PROXY satırını boş bırakabilirsiniz.
-DISCORD_PROXY=http://warp:1080
-# Türkiye sunucularında 'false' önerilir (boşuna engelli direkt SSL denemesi yapmaz, WARP'ı bekler).
-# Engelsiz VPS'lerde WARP çökünce direkt bağlantıya geçmesi için 'true' yapabilirsiniz.
+# Birincil SpoofDPI (tünelsiz/kopmasız) + Yedek Cloudflare WARP otomatik failover:
+DISCORD_PROXY=http://spoof-dpi:8080,http://warp:1080
+# Türkiye sunucularında 'false' önerilir (boşuna engelli direkt SSL denemesi yapmaz).
+# Engelsiz VPS'lerde proxy çökünce direkt bağlantıya geçmesi için 'true' yapabilirsiniz.
 DISCORD_PROXY_FALLBACK_DIRECT=false
 DISCORD_PROXY_FAILOVER_THRESHOLD=2
 
@@ -205,7 +241,7 @@ LOG_LEVEL=INFO
 | Değişken | Zorunluluk | Ne İşe Yarar? | Önerilen Değer |
 | :--- | :--- | :--- | :--- |
 | `DISCORD_BOT_TOKEN` | **Zorunlu** | Discord Bot giriş anahtarı | *(Bot tokeniniz)* |
-| `DISCORD_PROXY` | TR için önerilen | Çıkış proxy adresi (virgülle yedekli liste destekler) | `http://warp:1080` *(TR)* / boş *(EU/US)* |
+| `DISCORD_PROXY` | TR için önerilen | Çıkış proxy adresi (virgülle yedekli liste destekler) | `http://spoof-dpi:8080,http://warp:1080` *(TR)* / boş *(EU/US)* |
 | `DISCORD_PROXY_FALLBACK_DIRECT` | İsteğe bağlı | Proxy 503 verince direkt bağlantı denesin mi? | `false` *(TR)* / `true` *(EU/US)* |
 | `DISCORD_PROXY_FAILOVER_THRESHOLD` | İsteğe bağlı | Yedek/fallback öncesi ardışık proxy hata eşiği | `2` |
 | `MAX_ACTIVE_ALERTS` / `MAX_USER_ACTIVE_ALERTS` | İsteğe bağlı | Sistem geneli ve kullanıcı başı aktif alarm kotası | `250` / `25` |
@@ -227,9 +263,9 @@ python -m pytest tests -v
 ```
 
 ```text
-======================== 114 passed ========================
+======================== 115 passed ========================
 ```
-Authentication, dual parser, token bucket rate limiter, SQLite işlemleri, watchlist, DM bildirimleri, yüzdesel alarmlar, cache tazeliği, genişletilmiş sembol kataloğu, hibrit canlı arama, borsa öneki ayrıştırması, WARP proxy 503 failover/fallback koruması, piyasa beslemeleri (Binance/Yahoo), bot komutları ve tetikleyici motoru dahil **114 testin tamamı %100 yeşildir**.
+Authentication, dual parser, token bucket rate limiter, SQLite işlemleri, watchlist, DM bildirimleri, yüzdesel alarmlar, cache tazeliği, genişletilmiş sembol kataloğu, hibrit canlı arama, borsa öneki ayrıştırması, SpoofDPI + WARP çift proxy failover/fallback koruması, piyasa beslemeleri (Binance/Yahoo), bot komutları ve tetikleyici motoru dahil **115 testin tamamı %100 yeşildir**.
 
 ---
 
