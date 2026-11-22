@@ -167,14 +167,11 @@ TradingView grafik veya Pine Script stratejilerinizden botunuza sinyal gönderme
 5. Üretilen davet linkiyle botu sunucunuza ekleyin.
 
 ### 2. Coolify Ortam Değişkenleri (.env) — Tek Seferlik Tam Yapılandırma
-Aşağıdaki bloğu Coolify **Environment Variables** (veya `.env`) içerisine tek seferde yapıştırıp yalnızca token/şifre alanlarını doldurmanız yeterlidir; sonradan ek bir ayar değişikliği yapmanız gerekmez:
+Uygulamanın çalışması için **zorunlu olan tek değişken `DISCORD_BOT_TOKEN`**'dır. Aşağıdaki bloğu Coolify **Environment Variables** (veya `.env`) içerisine tek seferde yapıştırıp tokeninizi girmeniz yeterlidir; sonradan ek bir ayar değişikliği yapmanız gerekmez:
 
 ```env
-# === ZORUNLU ALANLAR (Sadece bunları kendi bilgilerinizle değiştirin) ===
+# === ZORUNLU ALAN (Sadece bunu kendi bot tokeninizle değiştirin) ===
 DISCORD_BOT_TOKEN=buraya_bot_tokeniniz
-DISCORD_ALERT_CHANNEL_ID=alarmlarin_duyurulacagi_kanal_id
-# TradingView Webhook kullanacaksanız güçlü bir gizli anahtar belirleyin (fail-closed)
-WEBHOOK_SECRET=buraya_guclu_bir_sifre_veya_token
 
 # === PROXY & BAĞLANTI DAYANIKLILIĞI (Türkiye / BTK Engeli İçin Önerilen) ===
 # Türkiye dışı (engelsiz Avrupa/ABD) VPS kullanıyorsanız DISCORD_PROXY satırını boş bırakabilirsiniz.
@@ -196,23 +193,28 @@ HTTP_TIMEOUT_SECONDS=10.0
 SQLITE_DB_PATH=/app/data/alerts.db
 LOG_LEVEL=INFO
 
-# === İSTEĞE BAĞLI: TRADINGVIEW DOĞRUDAN WEBHOOK ===
-# DISCORD_WEBHOOK_URL boş bırakılırsa, TradingView sinyalleri bot üzerinden DISCORD_ALERT_CHANNEL_ID'ye gönderilir!
+# === İSTEĞE BAĞLI ALANLAR (Kullanmıyorsanız hiç eklemenize gerek yok) ===
+# Tüm alarmları tek sabit kanala yönlendirmek isterseniz ekleyin; boşsa alarm kurulan kanala düşer:
+# DISCORD_ALERT_CHANNEL_ID=alarmlarin_duyurulacagi_kanal_id
+# Sadece TradingView Webhook (/webhook/...) kullanıyorsanız güçlü bir anahtar tanımlayın;
+# boş bırakıldığında bot sorunsuz çalışır, webhook uç noktası güvenlik için kapalı (fail-closed) kalır:
+# WEBHOOK_SECRET=buraya_guclu_bir_sifre_veya_token
 # DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/id/token
 ```
 
-| Değişken | Ne İşe Yarar? | Önerilen Değer |
-| :--- | :--- | :--- |
-| `DISCORD_BOT_TOKEN` | Discord Bot giriş anahtarı | *(Zorunlu)* |
-| `DISCORD_ALERT_CHANNEL_ID` | Alarmların düşeceği varsayılan kanal ID'si | *(Zorunlu)* |
-| `WEBHOOK_SECRET` | `/webhook/{secret}` güvenlik doğrulaması | *(Güçlü rastgele metin)* |
-| `DISCORD_PROXY` | Çıkış proxy adresi (virgülle yedekli liste destekler) | `http://warp:1080` *(TR)* / boş *(EU/US)* |
-| `DISCORD_PROXY_FALLBACK_DIRECT` | Proxy 503 verince direkt bağlantı denesin mi? | `false` *(TR)* / `true` *(EU/US)* |
-| `DISCORD_PROXY_FAILOVER_THRESHOLD` | Yedek/fallback öncesi ardışık proxy hata eşiği | `2` |
-| `MAX_ACTIVE_ALERTS` / `MAX_USER_ACTIVE_ALERTS` | Sistem geneli ve kullanıcı başı aktif alarm kotası | `250` / `25` |
-| `ALERT_EXPIRY_DAYS` | Tetiklenmeyen eski alarmların otomatik temizlenme süresi | `180` |
-| `YAHOO_POLL_INTERVAL_SECONDS` / `CACHE_TTL_SECONDS` | Hisse/Emtia/Döviz tarama ve önbellek tazelik süresi (sn) | `20.0` / `20.0` |
-| `SQLITE_DB_PATH` | Kalıcı veritabanı yolu (`/app/data` volume'u ile eşleşmeli) | `/app/data/alerts.db` |
+| Değişken | Zorunluluk | Ne İşe Yarar? | Önerilen Değer |
+| :--- | :--- | :--- | :--- |
+| `DISCORD_BOT_TOKEN` | **Zorunlu** | Discord Bot giriş anahtarı | *(Bot tokeniniz)* |
+| `DISCORD_PROXY` | TR için önerilen | Çıkış proxy adresi (virgülle yedekli liste destekler) | `http://warp:1080` *(TR)* / boş *(EU/US)* |
+| `DISCORD_PROXY_FALLBACK_DIRECT` | İsteğe bağlı | Proxy 503 verince direkt bağlantı denesin mi? | `false` *(TR)* / `true` *(EU/US)* |
+| `DISCORD_PROXY_FAILOVER_THRESHOLD` | İsteğe bağlı | Yedek/fallback öncesi ardışık proxy hata eşiği | `2` |
+| `MAX_ACTIVE_ALERTS` / `MAX_USER_ACTIVE_ALERTS` | İsteğe bağlı | Sistem geneli ve kullanıcı başı aktif alarm kotası | `250` / `25` |
+| `ALERT_EXPIRY_DAYS` | İsteğe bağlı | Tetiklenmeyen eski alarmların otomatik temizlenme süresi | `180` |
+| `YAHOO_POLL_INTERVAL_SECONDS` / `CACHE_TTL_SECONDS` | İsteğe bağlı | Hisse/Emtia/Döviz tarama ve önbellek tazelik süresi (sn) | `20.0` / `20.0` |
+| `SQLITE_DB_PATH` | İsteğe bağlı | Kalıcı veritabanı yolu (`/app/data` volume'u ile eşleşmeli) | `/app/data/alerts.db` |
+| `DISCORD_ALERT_CHANNEL_ID` | **İsteğe bağlı** | Sabit bildirim kanalı (boşsa `/alert set` yazılan kanala gönderir) | *(Boş bırakılabilir)* |
+| `WEBHOOK_SECRET` | **İsteğe bağlı** | Sadece TradingView Webhook kullanıyorsanız gerekli (boşsa webhook kilitli kalır, bot normal çalışır) | *(Webhook kullanmıyorsanız gerekmez)* |
+| `DISCORD_WEBHOOK_URL` | **İsteğe bağlı** | Sadece TradingView Webhook'u doğrudan Discord Webhook URL'sine iletmek için | *(Boş bırakılabilir)* |
 
 ---
 
