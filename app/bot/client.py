@@ -50,13 +50,23 @@ def _sanitize_mentions(text: str) -> str:
 
 def format_price(price: Optional[float]) -> str:
     """Format price nicely for both small crypto fractions and large indices."""
-    if price is None:
+    if price is None or isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price):
         return "*Alınamadı*"
-    if price >= 1000.0:
-        return f"${price:,.2f}"
-    if price >= 1.0:
-        return f"${price:,.4f}"
-    return f"${price:.8f}".rstrip("0")
+    if price == 0:
+        return "$0.00"
+    abs_price = abs(price)
+    sign = "-" if price < 0 else ""
+    if abs_price >= 1000.0:
+        return f"{sign}${abs_price:,.2f}"
+    if abs_price >= 1.0:
+        return f"{sign}${abs_price:,.4f}"
+    if abs_price >= 1e-8:
+        formatted = f"{abs_price:.8f}".rstrip("0").rstrip(".")
+        return f"{sign}${formatted}"
+    formatted = f"{abs_price:.12f}".rstrip("0").rstrip(".")
+    if formatted in ("", "0"):
+        return f"{sign}${abs_price:.2e}"
+    return f"{sign}${formatted}"
 
 
 async def safe_defer(

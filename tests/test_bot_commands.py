@@ -663,3 +663,20 @@ async def test_list_alerts_skips_inactive_dedupes_and_fetches_concurrently():
     assert 1 < peak_in_flight <= WATCHLIST_FETCH_CONCURRENCY
 
     await bot.close()
+
+
+def test_format_price_handles_zero_sub_1e8_and_nonfinite():
+    """LOGIC-FORMAT-003: format_price never emits malformed '$0.' for zero, sub-1e-8, or non-finite values."""
+    from app.bot.client import format_price
+
+    assert format_price(0.0) == "$0.00"
+    assert format_price(1e-9) == "$0.000000001"
+    assert not format_price(1e-9).endswith(".")
+    assert not format_price(1e-15).endswith(".")
+    assert format_price(0.00001230) == "$0.0000123"
+    assert format_price(1.5) == "$1.5000"
+    assert format_price(68450.5) == "$68,450.50"
+    assert format_price(None) == "*Alınamadı*"
+    assert format_price(float("nan")) == "*Alınamadı*"
+    assert format_price(float("inf")) == "*Alınamadı*"
+    assert format_price(float("-inf")) == "*Alınamadı*"
