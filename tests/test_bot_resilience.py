@@ -1063,4 +1063,41 @@ async def test_health_endpoints_redact_proxy_credentials_and_preserve_diagnostic
     assert "http://***@proxy.internal:8080" in dead_resp.json()["discord_bot"]["reason"]
 
 
+@pytest.mark.asyncio
+async def test_healthz_handles_nonfinite_and_negative_bot_latency(monkeypatch):
+    """RES-HEALTH-001: NaN/Inf/-Inf/negative/None bot.latency must return 200 with latency_ms == 0.0."""
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "valid_token_abc_123")
+    get_settings.cache_clear()
+
+    app = create_app()
+    running_task = asyncio.create_task(asyncio.sleep(30))
+    try:
+        mock_bot = MagicMock()
+        mock_bot.is_closed.return_value = False
+        mock_bot.is_ready.return_value = True
+        mock_bot.user = "AlertBot#1234"
+
+        app.state.discord_bot = mock_bot
+        app.state.discord_bot_task = running_task
+        client = TestClient(app)
+
+        for bad_latency in (float("nan"), float("inf"), float("-inf"), -1.0, None, True):
+            mock_bot.latency = bad_latency
+            resp = client.get("/healthz")
+            assert resp.status_code == 200
+            assert resp.json()["discord_bot"]["latency_ms"] == 0.0
+
+        # Happy path
+        mock_bot.latency = 0.0425
+        resp_ok = client.get("/healthz")
+        assert resp_ok.status_code == 200
+        assert resp_ok.json()["discord_bot"]["latency_ms"] == 42.5
+    finally:
+        running_task.cancel()
+        try:
+            await running_task
+        except asyncio.CancelledError:
+            pass
+
+
 

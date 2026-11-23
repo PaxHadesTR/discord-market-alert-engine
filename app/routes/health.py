@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import math
 import re
 import time
 from typing import Any, Dict, Tuple
@@ -63,7 +64,17 @@ def check_bot_health(request: Request) -> Tuple[bool, str, Dict[str, Any]]:
     # 2. Check bot ready state
     is_ready = bool(bot and not bot.is_closed() and bot.is_ready())
     if is_ready:
-        latency_ms = round(bot.latency * 1000, 1) if (bot and bot.latency) else 0.0
+        raw_latency = getattr(bot, "latency", None)
+        latency_ms = (
+            round(raw_latency * 1000, 1)
+            if (
+                isinstance(raw_latency, (int, float))
+                and not isinstance(raw_latency, bool)
+                and math.isfinite(raw_latency)
+                and raw_latency >= 0
+            )
+            else 0.0
+        )
         return True, "healthy", {
             "configured": True,
             "supervisor_alive": True,
