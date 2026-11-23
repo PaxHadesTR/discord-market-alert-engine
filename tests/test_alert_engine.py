@@ -481,3 +481,82 @@ async def test_logic_engine_002_rejects_bool_and_zero_ticks(setup_engine):
     # Subsequent duplicate tick must not re-fire
     await engine._on_price_tick("BTCUSDT", 59998.0)
     assert len(triggered) == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_active_symbols_does_not_overwrite_concurrent_mutations(setup_engine):
+    """F-1b85df3e0731: Stalled _refresh_active_symbols never drops concurrently added or reset symbols."""
+    import asyncio
+
+    engine, triggered, feed = setup_engine
+    feed.mock_prices["ETHUSDT"] = 3000.0
+    feed.mock_prices["SOLUSDT"] = 150.0
+
+    # Create a BTCUSDT alert and a SOLUSDT alert, then mark SOLUSDT as TRIGGERED
+    ok_btc, _, rec_btc = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price=70000.0,
+    )
+    ok_sol, _, rec_sol = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="SOLUSDT", target_price=160.0,
+    )
+    assert ok_btc and ok_sol
+    assert await engine.db.trigger_alert(rec_sol.id) is True
+    await engine._refresh_active_symbols()
+    assert engine._active_symbols == {"BTCUSDT"}
+
+    orig_get_active = engine.db.get_active_alerts
+    stalled_entered = asyncio.Event()
+    release_stall = asyncio.Event()
+    stalled_once = False
+
+    async def stalled_get_active(*args, **kwargs):
+        nonlocal stalled_once
+        result = await orig_get_active(*args, **kwargs)
+        # Only stall the first full-table refresh call (symbol is None)
+        if not stalled_once and not args and kwargs.get("symbol") is None:
+            stalled_once = True
+            stalled_entered.set()
+            await release_stall.wait()
+        return result
+
+    engine.db.get_active_alerts = stalled_get_active
+
+    # Start a refresh that reads only {BTCUSDT} then stalls before updating self._active_symbols
+    refresh_task = asyncio.create_task(engine._refresh_active_symbols())
+    await asyncio.wait_for(stalled_entered.wait(), timeout=2.0)
+
+    # While refresh_task is stalled, concurrently add ETHUSDT and reset SOLUSDT to ACTIVE
+    ok_eth, _, rec_eth = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="ETHUSDT", target_price=3500.0,
+    )
+    assert ok_eth
+    assert await engine.db.reset_alert_to_active(rec_sol.id) is True
+
+    # Release the stale refresh; it must detect the version bump and re-read fresh state
+    release_stall.set()
+    await asyncio.wait_for(refresh_task, timeout=2.0)
+
+    assert engine._active_symbols == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+
+    # Verify ticks for both newly added ETHUSDT and reset SOLUSDT trigger normally
+    await engine._on_price_tick("ETHUSDT", 3600.0)
+    await engine._on_price_tick("SOLUSDT", 170.0)
+    triggered_ids = {rec.id for rec, _ in triggered}
+    assert rec_eth.id in triggered_ids
+    assert rec_sol.id in triggered_ids
+
+    # Concurrent cancel/clear/create operations must complete without deadlocking _create_lock
+    results = await asyncio.gather(
+        engine.db.cancel_alert(rec_btc.id, "u1"),
+        engine.create_user_alert(
+            user_id="u2", user_name="User2", channel_id="c1", guild_id="g1",
+            raw_symbol="BTCUSDT", target_price=72000.0,
+        ),
+        engine.db.clear_user_alerts("u1"),
+        engine.db.expire_stale_alerts(30),
+    )
+    assert results[1][0] is True
+    assert "BTCUSDT" in engine._active_symbols
