@@ -157,9 +157,9 @@ class RearmAlertModal(discord.ui.Modal, title="🔄 Alarmı Yeniden Kur"):
         super().__init__()
         self.engine = engine
         self.alert = alert
-        self.target_price.default = f"{alert.target_price:g}"
+        self.target_price.default = f"{alert.target_price:g}"[:30]
         if alert.note:
-            self.note.default = alert.note
+            self.note.default = str(alert.note)[:MAX_ALERT_NOTE_LENGTH]
 
     async def on_submit(self, interaction: discord.Interaction):
         await safe_defer(interaction, ephemeral=True)

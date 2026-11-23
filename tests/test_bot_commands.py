@@ -522,3 +522,55 @@ async def test_sec_valid_001_bounds_note_symbol_and_legacy_embed_fields():
             assert len(f.value) <= 1024
 
     await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_rearm_modal_truncates_oversized_alert_notes(tmp_path):
+    """F-2d63a0765cef: RearmAlertModal truncates alert.note default to max_length=150."""
+    from app.bot.client import RearmAlertModal
+    from app.database.db import AlertDatabase
+    from app.services.alert_engine import AutonomousAlertEngine
+
+    # 1. Direct AlertRecord with 200-char note and 145-char + percentage suffix note
+    for raw_note in ("A" * 200, ("B" * 145) + " (+5% hedefi)"):
+        rec = AlertRecord(
+            id=1,
+            user_id="111",
+            user_name="Trader",
+            channel_id="222",
+            guild_id=None,
+            symbol="BTCUSDT",
+            asset_type="CRYPTO",
+            target_price=72000.0,
+            initial_price=68000.0,
+            direction="ABOVE",
+            status="TRIGGERED",
+            created_at="2026-10-29T20:00:00+00:00",
+            note=raw_note,
+        )
+        modal = RearmAlertModal(MagicMock(), rec)
+        assert modal.note.default == raw_note[:150]
+        assert len(modal.note.default) <= 150
+
+    # 2. Integration with create_user_alert appending '(+5% hedefi)'
+    db = AlertDatabase(str(tmp_path / "rearm_note.db"))
+    await db.init_db()
+    feed = MagicMock()
+    feed.get_current_price = AsyncMock(return_value=68000.0)
+    feed.add_listener = MagicMock()
+    feed.set_active_equity_supplier = MagicMock()
+    engine = AutonomousAlertEngine(db=db, price_feed=feed, settings=Settings())
+
+    ok, _, created = await engine.create_user_alert(
+        user_id="111",
+        user_name="Trader",
+        channel_id="222",
+        guild_id=None,
+        raw_symbol="BTCUSDT",
+        target_price="+5%",
+        note="C" * 145,
+    )
+    assert ok is True and created is not None
+    modal_int = RearmAlertModal(engine, created)
+    assert len(modal_int.note.default) <= 150
+    assert modal_int.note.default == created.note[:150]
