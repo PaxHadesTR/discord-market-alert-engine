@@ -680,3 +680,105 @@ def test_format_price_handles_zero_sub_1e8_and_nonfinite():
     assert format_price(float("nan")) == "*Alınamadı*"
     assert format_price(float("inf")) == "*Alınamadı*"
     assert format_price(float("-inf")) == "*Alınamadı*"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_alert_notification_dm_retry_fallback_and_channel_failures():
+    """V6-COVERAGE-001: Cover DM success, DM transient retry, DM->channel fallback, fetch_channel error, and channel retry exhaustion."""
+    import aiohttp
+
+    mock_engine = MagicMock()
+    settings = Settings(DISCORD_BOT_TOKEN="mock_token", DISCORD_ALERT_CHANNEL_ID=12345)
+    bot = DiscordAlertBot(engine=mock_engine, settings=settings)
+
+    dm_alert = AlertRecord(
+        id=201,
+        user_id="111",
+        user_name="Trader",
+        channel_id="12345",
+        guild_id=None,
+        symbol="BTCUSDT",
+        asset_type="CRYPTO",
+        target_price=70000.0,
+        initial_price=65000.0,
+        direction="ABOVE",
+        status="TRIGGERED",
+        created_at="2026-10-29T20:00:00+00:00",
+        notify_dm=True,
+    )
+    ch_alert = AlertRecord(
+        id=202,
+        user_id="111",
+        user_name="Trader",
+        channel_id="12345",
+        guild_id=None,
+        symbol="ETHUSDT",
+        asset_type="CRYPTO",
+        target_price=3500.0,
+        initial_price=3200.0,
+        direction="ABOVE",
+        status="TRIGGERED",
+        created_at="2026-10-29T20:00:00+00:00",
+        notify_dm=False,
+    )
+
+    with patch.object(bot, "is_closed", return_value=False), \
+         patch.object(bot, "is_ready", return_value=True), \
+         patch("app.bot.client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+
+        # (a) notify_dm=True happy path delivers via user.send without calling channel.send
+        dm_user = MagicMock()
+        dm_user.send = AsyncMock()
+        ch_unused = MagicMock()
+        ch_unused.send = AsyncMock()
+        with patch.object(bot, "get_user", return_value=dm_user), \
+             patch.object(bot, "get_channel", return_value=ch_unused):
+            assert await bot.dispatch_alert_notification(dm_alert, 70500.0) is True
+            dm_user.send.assert_awaited_once()
+            ch_unused.send.assert_not_awaited()
+
+        # (b) notify_dm=True transient aiohttp.ClientError retries and succeeds on attempt 2
+        dm_attempts = 0
+
+        async def flaky_dm_send(**kwargs):
+            nonlocal dm_attempts
+            dm_attempts += 1
+            if dm_attempts == 1:
+                raise aiohttp.ClientError("transient proxy error")
+
+        flaky_user = MagicMock()
+        flaky_user.send = AsyncMock(side_effect=flaky_dm_send)
+        mock_sleep.reset_mock()
+        with patch.object(bot, "get_user", return_value=flaky_user), \
+             patch.object(bot, "get_channel", return_value=ch_unused):
+            assert await bot.dispatch_alert_notification(dm_alert, 70500.0) is True
+            assert dm_attempts == 2
+            assert mock_sleep.await_count == 1
+            ch_unused.send.assert_not_awaited()
+
+        # (c) notify_dm=True non-retryable failure (e.g., DM blocked / Forbidden) falls back to channel.send
+        blocked_user = MagicMock()
+        blocked_user.send = AsyncMock(side_effect=RuntimeError("Forbidden: Cannot send messages to this user"))
+        fallback_channel = MagicMock()
+        fallback_channel.send = AsyncMock()
+        with patch.object(bot, "get_user", return_value=blocked_user), \
+             patch.object(bot, "get_channel", return_value=fallback_channel):
+            assert await bot.dispatch_alert_notification(dm_alert, 70500.0) is True
+            blocked_user.send.assert_awaited_once()
+            fallback_channel.send.assert_awaited_once()
+
+        # (d) get_channel returning None + fetch_channel raising returns False
+        with patch.object(bot, "get_channel", return_value=None), \
+             patch.object(bot, "fetch_channel", new_callable=AsyncMock, side_effect=RuntimeError("Not Found")):
+            assert await bot.dispatch_alert_notification(ch_alert, 3600.0) is False
+
+        # (e) channel.send failing all 3 aiohttp.ClientError attempts returns False with 2 sleeps
+        failing_channel = MagicMock()
+        failing_channel.send = AsyncMock(side_effect=aiohttp.ClientError("gateway down"))
+        mock_sleep.reset_mock()
+        with patch.object(bot, "get_channel", return_value=failing_channel):
+            assert await bot.dispatch_alert_notification(ch_alert, 3600.0) is False
+            assert failing_channel.send.await_count == 3
+            assert mock_sleep.await_count == 2
+
+    await bot.close()
