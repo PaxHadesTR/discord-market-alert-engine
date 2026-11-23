@@ -23,25 +23,30 @@ class AlertQueueService:
         self.queue: asyncio.Queue[AlertPayload] = asyncio.Queue(maxsize=max_capacity)
         self._worker_task: Optional[asyncio.Task] = None
         self._running = False
+        self._stopped = False
+        self._providers_closed = False
         self._total_processed = 0
         self._total_failed = 0
 
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         """Start the background consumer task."""
+        if self._stopped:
+            logger.debug("AlertQueueService has been stopped; ignoring start() call.")
+            return
         if self._worker_task and not self._worker_task.done():
             return
-        self._running = True
         try:
             target_loop = loop or asyncio.get_running_loop()
+            self._running = True
             self._worker_task = target_loop.create_task(self._worker_loop(), name="alert_queue_worker")
             logger.info("AlertQueueService background worker started with capacity %d.", self.max_capacity)
         except RuntimeError:
+            self._running = False
             logger.debug("No active event loop running when starting queue; worker will attach when loop starts.")
 
     async def stop(self) -> None:
-        """Gracefully stop the background worker and close providers."""
-        if not self._running:
-            return
+        """Gracefully stop the background worker and close providers (idempotent)."""
+        self._stopped = True
         self._running = False
         if self._worker_task:
             self._worker_task.cancel()
@@ -51,16 +56,22 @@ class AlertQueueService:
                 pass
             self._worker_task = None
 
-        for provider in self.providers:
-            try:
-                await provider.close()
-            except Exception as e:
-                logger.warning("Error closing provider %s: %s", provider, e)
+        if not self._providers_closed:
+            self._providers_closed = True
+            for provider in self.providers:
+                try:
+                    await provider.close()
+                except Exception as e:
+                    logger.warning("Error closing provider %s: %s", provider, e)
 
         logger.info("AlertQueueService stopped. Total processed: %d, failed: %d", self._total_processed, self._total_failed)
 
     def enqueue(self, alert: AlertPayload) -> bool:
-        """Enqueue an alert without blocking. Returns False if queue is full."""
+        """Enqueue an alert without blocking. Returns False if stopped or queue is full."""
+        if self._stopped:
+            logger.warning("AlertQueueService is stopped; rejecting alert for %s", alert.ticker)
+            self._total_failed += 1
+            return False
         if self._worker_task is None or self._worker_task.done():
             self.start()
         try:

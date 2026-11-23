@@ -234,3 +234,54 @@ async def test_webhook_placeholder_validation_bot_fallback_and_missing_provider_
         async with lifespan(app_none):
             assert app_none.state.queue_service.providers == []
             assert "No active TradingView webhook notification provider" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_queue_stop_before_start_closes_providers_and_rejects_enqueue_after_stop():
+    """RES-QUEUE-001: stop() closes providers even if never started; enqueue() rejects items after stop()."""
+    # 1. Stop-before-start closes provider resources cleanly and is idempotent
+    close_calls = 0
+
+    class _TrackedProvider(MockNotificationProvider):
+        async def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            await super().close()
+
+    provider_unstarted = _TrackedProvider()
+    queue_unstarted = AlertQueueService(
+        providers=[provider_unstarted],
+        rate_limiter=AsyncTokenBucket(rate=100.0),
+        max_capacity=10,
+    )
+    await queue_unstarted.stop()
+    assert provider_unstarted.is_closed is True
+    assert close_calls == 1
+    await queue_unstarted.stop()
+    assert close_calls == 1
+
+    # 2. Enqueue-after-stop returns False and does not revive worker
+    provider_stopped = _TrackedProvider()
+    queue_stopped = AlertQueueService(
+        providers=[provider_stopped],
+        rate_limiter=AsyncTokenBucket(rate=100.0),
+        max_capacity=10,
+    )
+    queue_stopped.start()
+    await queue_stopped.stop()
+    assert queue_stopped.enqueue(AlertPayload(ticker="BTCUSDT", action="BUY")) is False
+    assert queue_stopped._worker_task is None
+    assert queue_stopped._running is False
+
+    # 3. Happy path: lazy start via enqueue() before stop() still dispatches normally
+    provider_lazy = MockNotificationProvider()
+    queue_lazy = AlertQueueService(
+        providers=[provider_lazy],
+        rate_limiter=AsyncTokenBucket(rate=1000.0),
+        max_capacity=10,
+    )
+    assert queue_lazy.enqueue(AlertPayload(ticker="ETHUSDT", action="BUY", price=3500.0)) is True
+    await asyncio.sleep(0.05)
+    assert len(provider_lazy.dispatched_alerts) == 1
+    await queue_lazy.stop()
+    assert provider_lazy.is_closed is True
