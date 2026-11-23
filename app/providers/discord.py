@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 from typing import Any, Dict, List, Optional
+import aiohttp
 import httpx
 from app.models.alert import AlertPayload
 from app.providers.base import BaseNotificationProvider
@@ -268,18 +269,17 @@ class DiscordBotNotificationProvider(BaseNotificationProvider):
         if not self.bot or not self.channel_id:
             return False
 
-        if getattr(self.bot, "is_closed", None) and self.bot.is_closed():
+        is_closed = getattr(self.bot, "is_closed", None)
+        if callable(is_closed) and is_closed():
             logger.warning("DiscordBotNotificationProvider: Bot client is closed/reconnecting. Skipping dispatch.")
             return False
 
-        try:
-            channel = self.bot.get_channel(self.channel_id)
-            if not channel:
-                channel = await self.bot.fetch_channel(self.channel_id)
-            if not channel:
-                logger.error("DiscordBotNotificationProvider: Channel %s not found.", self.channel_id)
-                return False
+        is_ready = getattr(self.bot, "is_ready", None)
+        if callable(is_ready) and not is_ready():
+            logger.warning("DiscordBotNotificationProvider: Bot client is not ready yet. Skipping dispatch.")
+            return False
 
+        try:
             import discord
             is_bullish = alert.is_bullish
             is_bearish = alert.is_bearish
@@ -323,12 +323,43 @@ class DiscordBotNotificationProvider(BaseNotificationProvider):
             for item in bounded_fields:
                 embed.add_field(name=item["name"], value=item["value"], inline=item["inline"])
             embed.set_footer(text=footer_text)
-            await channel.send(embed=embed)
-            logger.info("Successfully dispatched TradingView alert via Bot to channel %s", self.channel_id)
-            return True
         except Exception as e:
-            logger.error("Failed dispatching alert via Discord Bot: %s", e)
+            logger.error("Failed building embed for Discord Bot dispatch: %s", e)
             return False
+
+        max_retries = 3
+        backoff = 0.5
+        for attempt in range(1, max_retries + 1):
+            try:
+                channel = self.bot.get_channel(self.channel_id)
+                if not channel:
+                    channel = await self.bot.fetch_channel(self.channel_id)
+                if not channel:
+                    logger.error("DiscordBotNotificationProvider: Channel %s not found.", self.channel_id)
+                    return False
+
+                await channel.send(embed=embed)
+                logger.info("Successfully dispatched TradingView alert via Bot to channel %s", self.channel_id)
+                return True
+            except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+                logger.warning(
+                    "Transient error dispatching alert via Discord Bot (attempt %d/%d): %s",
+                    attempt, max_retries, net_err,
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                else:
+                    logger.error(
+                        "Failed dispatching alert via Discord Bot after %d attempts: %s",
+                        max_retries, net_err,
+                    )
+                    return False
+            except Exception as e:
+                logger.error("Failed dispatching alert via Discord Bot: %s", e)
+                return False
+
+        return False
 
     async def close(self) -> None:
         pass

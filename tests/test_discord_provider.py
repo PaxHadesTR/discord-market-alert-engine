@@ -236,3 +236,80 @@ async def test_discord_webhook_clamps_retry_after_and_skips_final_sleep():
         with patch("app.providers.discord.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             assert await provider.send(alert) is False
             assert mock_sleep.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_provider_checks_ready_and_retries_transient_errors():
+    """RES-PROV-002: DiscordBotNotificationProvider guards is_ready(), retries transient network errors, and fails fast on non-retryable errors."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    import aiohttp
+    from app.providers.discord import DiscordBotNotificationProvider
+
+    alert = AlertPayload(ticker="BTCUSDT", action="BUY", price=68000, message="Signal")
+
+    # 1. Unready bot returns False immediately without touching channels
+    unready_bot = MagicMock()
+    unready_bot.is_closed.return_value = False
+    unready_bot.is_ready.return_value = False
+    provider_unready = DiscordBotNotificationProvider(bot=unready_bot, channel_id=999)
+    assert await provider_unready.send(alert) is False
+    unready_bot.get_channel.assert_not_called()
+
+    # 2. Transient errors on fetch_channel + channel.send recover on attempt 3
+    attempts = {"fetch": 0, "send": 0}
+    flaky_channel = MagicMock()
+
+    async def flaky_send(embed=None):
+        attempts["send"] += 1
+        if attempts["send"] == 1:
+            raise asyncio.TimeoutError("gateway timeout")
+
+    flaky_channel.send = AsyncMock(side_effect=flaky_send)
+
+    flaky_bot = MagicMock()
+    flaky_bot.is_closed.return_value = False
+    flaky_bot.is_ready.return_value = True
+    flaky_bot.get_channel.return_value = None
+
+    async def flaky_fetch(cid):
+        attempts["fetch"] += 1
+        if attempts["fetch"] == 1:
+            raise aiohttp.ClientError("proxy 503")
+        return flaky_channel
+
+    flaky_bot.fetch_channel = AsyncMock(side_effect=flaky_fetch)
+    provider_flaky = DiscordBotNotificationProvider(bot=flaky_bot, channel_id=999)
+    with patch("app.providers.discord.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        assert await provider_flaky.send(alert) is True
+        assert attempts["fetch"] == 3
+        assert attempts["send"] == 2
+        assert mock_sleep.await_count == 2
+
+    # 3. Transient failure across all 3 attempts returns False and sleeps only twice
+    always_fail_ch = MagicMock()
+    always_fail_ch.send = AsyncMock(side_effect=aiohttp.ClientError("still down"))
+    fail_bot = MagicMock()
+    fail_bot.is_closed.return_value = False
+    fail_bot.is_ready.return_value = True
+    fail_bot.get_channel.return_value = always_fail_ch
+
+    provider_fail = DiscordBotNotificationProvider(bot=fail_bot, channel_id=999)
+    with patch("app.providers.discord.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        assert await provider_fail.send(alert) is False
+        assert always_fail_ch.send.await_count == 3
+        assert mock_sleep.await_count == 2
+
+    # 4. Non-retryable ValueError fails immediately without retry or sleep
+    bad_ch = MagicMock()
+    bad_ch.send = AsyncMock(side_effect=ValueError("bad embed"))
+    bad_bot = MagicMock()
+    bad_bot.is_closed.return_value = False
+    bad_bot.is_ready.return_value = True
+    bad_bot.get_channel.return_value = bad_ch
+
+    provider_bad = DiscordBotNotificationProvider(bot=bad_bot, channel_id=999)
+    with patch("app.providers.discord.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        assert await provider_bad.send(alert) is False
+        assert bad_ch.send.await_count == 1
+        mock_sleep.assert_not_awaited()
