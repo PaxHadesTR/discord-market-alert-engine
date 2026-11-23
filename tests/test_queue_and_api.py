@@ -152,3 +152,85 @@ def test_cors_does_not_reflect_untrusted_origin_with_credentials(client: TestCli
     r_opt = client.options("/webhook", headers={**headers, "Access-Control-Request-Method": "POST"})
     assert r_opt.headers.get("access-control-allow-credentials") != "true"
     assert r_opt.headers.get("access-control-allow-origin") not in ("*", "https://evil.example")
+
+
+@pytest.mark.asyncio
+async def test_webhook_placeholder_validation_bot_fallback_and_missing_provider_warning(
+    monkeypatch, tmp_path, caplog
+):
+    """V7-CONTRACT-001: Placeholder DISCORD_WEBHOOK_URL allows bot fallback and missing providers log WARNING."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from fastapi import FastAPI
+    from app.config import get_settings
+    from app.main import is_valid_discord_webhook_url, lifespan
+    from app.providers.discord import DiscordBotNotificationProvider
+
+    # 1. Placeholder vs valid URL classification
+    for bad_url in (
+        None,
+        "",
+        "   ",
+        "https://discord.com/api/webhooks/your/webhook/url/here",
+        "https://discord.com/api/webhooks/id/token",
+        "not-a-url",
+    ):
+        assert is_valid_discord_webhook_url(bad_url) is False
+
+    for good_url in (
+        "https://discord.com/api/webhooks/mock/test",
+        "https://discord.com/api/webhooks/123456/abcdef",
+    ):
+        assert is_valid_discord_webhook_url(good_url) is True
+
+    # 2. Placeholder DISCORD_WEBHOOK_URL + DISCORD_ALERT_CHANNEL_ID falls back to DiscordBotNotificationProvider
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "fallback.db"))
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/your/webhook/url/here")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "valid_token_abc_123")
+    monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", "987654321")
+    get_settings.cache_clear()
+
+    release_bot = asyncio.Event()
+
+    def make_bot(*args, **kwargs):
+        b = MagicMock()
+        b.is_closed.return_value = False
+
+        async def _start(token):
+            await release_bot.wait()
+
+        async def _close():
+            b.is_closed.return_value = True
+            release_bot.set()
+
+        b.start = AsyncMock(side_effect=_start)
+        b.close = AsyncMock(side_effect=_close)
+        return b
+
+    app_fb = FastAPI()
+    with patch("app.main.DiscordAlertBot", side_effect=make_bot), \
+         patch("app.market_data.binance.BinanceMarketFeed.start_stream", MagicMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.start_polling", MagicMock()), \
+         patch("app.market_data.binance.BinanceMarketFeed.stop", AsyncMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.stop", AsyncMock()):
+        async with lifespan(app_fb):
+            providers = app_fb.state.queue_service.providers
+            assert len(providers) == 1
+            assert isinstance(providers[0], DiscordBotNotificationProvider)
+            assert providers[0].channel_id == 987654321
+
+    # 3. Neither webhook nor channel ID configured logs explicit startup WARNING
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "no_provider.db"))
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "")
+    monkeypatch.delenv("DISCORD_ALERT_CHANNEL_ID", raising=False)
+    get_settings.cache_clear()
+
+    app_none = FastAPI()
+    with caplog.at_level("WARNING", logger="tradingview_alerts"), \
+         patch("app.market_data.binance.BinanceMarketFeed.start_stream", MagicMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.start_polling", MagicMock()), \
+         patch("app.market_data.binance.BinanceMarketFeed.stop", AsyncMock()), \
+         patch("app.market_data.yahoo.YahooFinanceFeed.stop", AsyncMock()):
+        async with lifespan(app_none):
+            assert app_none.state.queue_service.providers == []
+            assert "No active TradingView webhook notification provider" in caplog.text
