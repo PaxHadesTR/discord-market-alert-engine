@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 from typing import Any, Dict, List, Optional
 import httpx
 from app.models.alert import AlertPayload
@@ -146,15 +147,22 @@ class DiscordWebhookProvider(BaseNotificationProvider):
                     retry_after = 2.0
                     try:
                         rate_data = response.json()
-                        retry_after = float(rate_data.get("retry_after", 2.0))
+                        raw_retry = rate_data.get("retry_after", 2.0)
+                        if not isinstance(raw_retry, bool):
+                            parsed_retry = float(raw_retry)
+                            if math.isfinite(parsed_retry) and parsed_retry >= 0:
+                                retry_after = parsed_retry
                     except Exception:
                         pass
+                    retry_after = min(retry_after, 30.0)
                     logger.warning("Discord 429 Rate Limit hit. Backing off for %.2fs (Attempt %d/%d)", retry_after, attempt, max_retries)
-                    await asyncio.sleep(retry_after)
+                    if attempt < max_retries:
+                        await asyncio.sleep(retry_after)
 
                 elif response.status_code >= 500:
                     logger.warning("Discord server error (HTTP %d). Retrying in %.2fs...", response.status_code, backoff)
-                    await asyncio.sleep(backoff)
+                    if attempt < max_retries:
+                        await asyncio.sleep(backoff)
                     backoff *= 2
 
                 else:
@@ -163,7 +171,8 @@ class DiscordWebhookProvider(BaseNotificationProvider):
 
             except (httpx.RequestError, httpx.TimeoutException) as exc:
                 logger.warning("Network error while dispatching to Discord: %s. Retrying in %.2fs...", exc, backoff)
-                await asyncio.sleep(backoff)
+                if attempt < max_retries:
+                    await asyncio.sleep(backoff)
                 backoff *= 2
             except Exception as e:
                 logger.error("Unexpected error in Discord dispatch: %s", e, exc_info=True)

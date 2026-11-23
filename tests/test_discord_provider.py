@@ -181,3 +181,58 @@ async def test_discord_providers_enforce_embed_length_and_total_budget():
         assert 1 <= len(f.value) <= 1024
 
     await webhook_provider.close()
+
+
+@pytest.mark.asyncio
+async def test_discord_webhook_clamps_retry_after_and_skips_final_sleep():
+    """RES-PROV-001: Adversarial 429 retry_after values are clamped <= 30s and final attempt never sleeps."""
+    import math
+    from unittest.mock import AsyncMock, patch
+
+    alert = AlertPayload(ticker="BTCUSDT", action="BUY", price=65000)
+
+    # 1. Adversarial 429 retry_after values
+    adversarial_payloads = [
+        b'{"retry_after": 999999}',
+        b'{"retry_after": Infinity}',
+        b'{"retry_after": NaN}',
+        b'{"retry_after": -5.0}',
+        b'{"retry_after": "not-a-number"}',
+    ]
+    for raw_body in adversarial_payloads:
+        def handler_429(request: httpx.Request, body=raw_body) -> httpx.Response:
+            return httpx.Response(status_code=429, content=body, headers={"content-type": "application/json"})
+
+        sleep_calls = []
+
+        async def fake_sleep(delay: float):
+            sleep_calls.append(delay)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_429)) as mock_client:
+            provider = DiscordWebhookProvider(webhook_url="https://discord.com/api/webhooks/test", client=mock_client)
+            with patch("app.providers.discord.asyncio.sleep", side_effect=fake_sleep):
+                ok = await provider.send(alert)
+                assert ok is False
+                assert len(sleep_calls) == 2
+                for d in sleep_calls:
+                    assert math.isfinite(d) and 0.0 <= d <= 30.0
+
+    # 2. HTTP 500 exhaustion sleeps exactly twice (not on attempt 3)
+    def handler_500(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code=500, text="Server Error")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_500)) as mock_client:
+        provider = DiscordWebhookProvider(webhook_url="https://discord.com/api/webhooks/test", client=mock_client)
+        with patch("app.providers.discord.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            assert await provider.send(alert) is False
+            assert mock_sleep.await_count == 2
+
+    # 3. httpx.ReadTimeout exhaustion sleeps exactly twice (not on attempt 3)
+    def handler_timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_timeout)) as mock_client:
+        provider = DiscordWebhookProvider(webhook_url="https://discord.com/api/webhooks/test", client=mock_client)
+        with patch("app.providers.discord.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            assert await provider.send(alert) is False
+            assert mock_sleep.await_count == 2
