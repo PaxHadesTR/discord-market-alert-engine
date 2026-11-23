@@ -574,3 +574,92 @@ async def test_rearm_modal_truncates_oversized_alert_notes(tmp_path):
     modal_int = RearmAlertModal(engine, created)
     assert len(modal_int.note.default) <= 150
     assert modal_int.note.default == created.note[:150]
+
+
+@pytest.mark.asyncio
+async def test_list_alerts_skips_inactive_dedupes_and_fetches_concurrently():
+    """RES-BOT-002: /alert list skips non-ACTIVE lookups, dedupes symbols, bounds concurrency, and isolates errors."""
+    import asyncio
+    from app.bot.client import WATCHLIST_FETCH_CONCURRENCY
+
+    # 1. Non-ACTIVE alerts never invoke feed.get_current_price
+    inactive_alerts = [
+        AlertRecord(
+            id=idx,
+            user_id="111",
+            user_name="Trader",
+            channel_id="222",
+            guild_id=None,
+            symbol=f"SYM{idx}",
+            asset_type="CRYPTO",
+            target_price=100.0,
+            initial_price=90.0,
+            direction="ABOVE",
+            status=st,
+            created_at="2026-10-29T20:00:00+00:00",
+        )
+        for idx, st in enumerate(("TRIGGERED", "CANCELLED", "EXPIRED"), start=1)
+    ]
+
+    mock_engine = MagicMock()
+    mock_engine.db = MagicMock()
+    mock_engine.db.get_user_alerts = AsyncMock(return_value=inactive_alerts)
+    mock_engine.feed = MagicMock()
+    mock_engine.feed.get_current_price = AsyncMock(return_value=95.0)
+
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    bot._register_commands()
+    list_cmd = bot.tree.get_command("alert").get_command("list")
+
+    inter_inactive = _make_mock_interaction(user_id=111)
+    await list_cmd.callback(inter_inactive, status="ALL")
+    mock_engine.feed.get_current_price.assert_not_awaited()
+    assert len(inter_inactive.followup.send.call_args.kwargs["embed"].fields) == 3
+
+    # 2. 15 ACTIVE alerts across 10 distinct symbols (5 duplicates), 1 symbol raises RuntimeError
+    active_symbols = [f"COIN{i}USDT" for i in range(10)] + [f"COIN{i}USDT" for i in range(5)]
+    active_alerts = [
+        AlertRecord(
+            id=100 + idx,
+            user_id="111",
+            user_name="Trader",
+            channel_id="222",
+            guild_id=None,
+            symbol=sym,
+            asset_type="CRYPTO",
+            target_price=120.0,
+            initial_price=100.0,
+            direction="ABOVE",
+            status="ACTIVE",
+            created_at="2026-10-29T20:00:00+00:00",
+        )
+        for idx, sym in enumerate(active_symbols)
+    ]
+
+    in_flight = 0
+    peak_in_flight = 0
+    fetched = []
+
+    async def fake_price(sym: str):
+        nonlocal in_flight, peak_in_flight
+        fetched.append(sym)
+        in_flight += 1
+        peak_in_flight = max(peak_in_flight, in_flight)
+        await asyncio.sleep(0.02)
+        in_flight -= 1
+        if sym == "COIN3USDT":
+            raise RuntimeError("Upstream error")
+        return 110.0
+
+    mock_engine.db.get_user_alerts = AsyncMock(return_value=active_alerts)
+    mock_engine.feed.get_current_price = fake_price
+
+    inter_active = _make_mock_interaction(user_id=111)
+    await list_cmd.callback(inter_active, status="ACTIVE")
+    embed = inter_active.followup.send.call_args.kwargs["embed"]
+    assert len(embed.fields) == 15
+    assert len(fetched) == 10
+    assert len(set(fetched)) == 10
+    assert 1 < peak_in_flight <= WATCHLIST_FETCH_CONCURRENCY
+
+    await bot.close()

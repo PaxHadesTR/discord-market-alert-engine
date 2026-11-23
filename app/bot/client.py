@@ -751,13 +751,30 @@ class DiscordAlertBot(commands.Bot):
                 color=0x3399FF,
             )
 
-            for a in alerts[:15]:
+            displayed_alerts = alerts[:15]
+            active_symbols = list(dict.fromkeys(a.symbol for a in displayed_alerts if a.status == "ACTIVE"))
+            prices_by_symbol = {}
+            if active_symbols:
+                semaphore = asyncio.Semaphore(WATCHLIST_FETCH_CONCURRENCY)
+
+                async def _fetch_alert_price(sym: str) -> Optional[float]:
+                    async with semaphore:
+                        return await self.engine.feed.get_current_price(sym)
+
+                price_results = await asyncio.gather(
+                    *[_fetch_alert_price(sym) for sym in active_symbols],
+                    return_exceptions=True,
+                )
+                for sym, res in zip(active_symbols, price_results):
+                    prices_by_symbol[sym] = None if isinstance(res, Exception) else res
+
+            for a in displayed_alerts:
                 status_icon = "🟢" if a.status == "ACTIVE" else ("⚡" if a.status == "TRIGGERED" else "⚪")
                 arrow = "⬆️" if a.direction == "ABOVE" else "⬇️"
                 note_str = f"\n> 📝 *{a.note}*" if a.note else ""
                 dm_str = " 📬" if a.notify_dm else ""
 
-                current_price = await self.engine.feed.get_current_price(a.symbol)
+                current_price = prices_by_symbol.get(a.symbol) if a.status == "ACTIVE" else None
                 if current_price is not None and math.isfinite(current_price) and current_price > 0 and a.status == "ACTIVE":
                     pct_distance = ((a.target_price - current_price) / current_price) * 100
                     dist_str = f" (Fark: `{pct_distance:+.2f}%`)"
