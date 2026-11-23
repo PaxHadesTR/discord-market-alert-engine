@@ -285,3 +285,17 @@ async def test_queue_stop_before_start_closes_providers_and_rejects_enqueue_afte
     assert len(provider_lazy.dispatched_alerts) == 1
     await queue_lazy.stop()
     assert provider_lazy.is_closed is True
+
+
+def test_readme_max_active_alerts_default_matches_settings():
+    """V7-DOCS-002: README Coolify configuration and table match Settings.MAX_ACTIVE_ALERTS (100)."""
+    from pathlib import Path
+    from app.config import Settings
+
+    default_cap = Settings().MAX_ACTIVE_ALERTS
+    assert default_cap == 100
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    assert f"MAX_ACTIVE_ALERTS={default_cap}" in readme
+    assert "MAX_ACTIVE_ALERTS=250" not in readme
+    assert "`250` / `25`" not in readme
+    assert f"`{default_cap}` / `25`" in readme

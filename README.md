@@ -218,7 +218,7 @@ DISCORD_PROXY_FALLBACK_DIRECT=false
 DISCORD_PROXY_FAILOVER_THRESHOLD=2
 
 # === SİSTEM, KOTA VE PERFORMANS (Varsayılan Hazır Değerler) ===
-MAX_ACTIVE_ALERTS=250
+MAX_ACTIVE_ALERTS=100
 MAX_USER_ACTIVE_ALERTS=25
 ALERT_EXPIRY_DAYS=180
 YAHOO_POLL_INTERVAL_SECONDS=20.0
@@ -244,7 +244,7 @@ LOG_LEVEL=INFO
 | `DISCORD_PROXY` | TR için önerilen | Çıkış proxy adresi (virgülle yedekli liste destekler) | `http://spoof-dpi:8080,http://warp:1080` *(TR)* / boş *(EU/US)* |
 | `DISCORD_PROXY_FALLBACK_DIRECT` | İsteğe bağlı | Proxy 503 verince direkt bağlantı denesin mi? | `false` *(TR)* / `true` *(EU/US)* |
 | `DISCORD_PROXY_FAILOVER_THRESHOLD` | İsteğe bağlı | Yedek/fallback öncesi ardışık proxy hata eşiği | `2` |
-| `MAX_ACTIVE_ALERTS` / `MAX_USER_ACTIVE_ALERTS` | İsteğe bağlı | Sistem geneli ve kullanıcı başı aktif alarm kotası | `250` / `25` |
+| `MAX_ACTIVE_ALERTS` / `MAX_USER_ACTIVE_ALERTS` | İsteğe bağlı | Sistem geneli ve kullanıcı başı aktif alarm kotası | `100` / `25` |
 | `ALERT_EXPIRY_DAYS` | İsteğe bağlı | Tetiklenmeyen eski alarmların otomatik temizlenme süresi | `180` |
 | `YAHOO_POLL_INTERVAL_SECONDS` / `CACHE_TTL_SECONDS` | İsteğe bağlı | Hisse/Emtia/Döviz tarama ve önbellek tazelik süresi (sn) | `20.0` / `20.0` |
 | `SQLITE_DB_PATH` | İsteğe bağlı | Kalıcı veritabanı yolu (`/app/data` volume'u ile eşleşmeli) | `/app/data/alerts.db` |
