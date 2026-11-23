@@ -193,6 +193,8 @@ class AutonomousAlertEngine:
 
     async def _on_price_tick(self, symbol: str, current_price: float) -> None:
         """Evaluate active alerts when a price tick arrives."""
+        if not math.isfinite(current_price) or current_price <= 0:
+            return
         if not self._is_callback_ready():
             return
         norm_symbol = symbol.upper().strip()
