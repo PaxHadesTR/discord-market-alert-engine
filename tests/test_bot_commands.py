@@ -420,3 +420,365 @@ async def test_slash_commands_and_rearm_modal_happy_paths():
     assert "yeniden aktif edildi" in inter_modal.followup.send.call_args.kwargs["content"]
 
     await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_sec_valid_001_bounds_note_symbol_and_legacy_embed_fields():
+    """SEC-VALID-001: Oversized notes/symbols are clamped and legacy 1500-char DB notes never exceed Discord embed limits."""
+    oversized_note = "N" * 2000
+    oversized_symbol = "S" * 3000
+    legacy_note = "L" * 1500
+
+    legacy_record = AlertRecord(
+        id=88,
+        user_id="111",
+        user_name="Trader",
+        channel_id="222",
+        guild_id=None,
+        symbol="BTCUSDT",
+        asset_type="CRYPTO",
+        target_price=72000.0,
+        initial_price=68000.0,
+        direction="ABOVE",
+        status="ACTIVE",
+        created_at="2026-10-29T20:00:00+00:00",
+        note=legacy_note,
+    )
+
+    captured_create_kwargs = {}
+
+    async def fake_create_user_alert(**kwargs):
+        captured_create_kwargs.update(kwargs)
+        rec = AlertRecord(
+            id=89,
+            user_id=kwargs["user_id"],
+            user_name=kwargs["user_name"],
+            channel_id=kwargs["channel_id"],
+            guild_id=kwargs["guild_id"],
+            symbol=kwargs["raw_symbol"],
+            asset_type="CRYPTO",
+            target_price=72000.0,
+            initial_price=68000.0,
+            direction="ABOVE",
+            status="ACTIVE",
+            created_at="2026-10-29T20:00:00+00:00",
+            note=kwargs["note"],
+        )
+        return True, "OK", rec
+
+    mock_engine = MagicMock()
+    mock_engine.create_user_alert = AsyncMock(side_effect=fake_create_user_alert)
+    mock_engine.db = MagicMock()
+    mock_engine.db.get_user_alerts = AsyncMock(return_value=[legacy_record])
+    mock_engine.feed = MagicMock()
+    mock_engine.feed.get_current_price = AsyncMock(return_value=None)
+
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token", DISCORD_ALERT_CHANNEL_ID=222))
+    bot._register_commands()
+
+    # 1. /alert set truncates 2000-char note to <= 150 chars before DB persistence and bounds embed fields
+    alert_group = bot.tree.get_command("alert")
+    inter_set = _make_mock_interaction(user_id=111)
+    await alert_group.get_command("set").callback(
+        inter_set, symbol="BTCUSDT", target_price="72000", note=oversized_note, dm=False
+    )
+    assert len(captured_create_kwargs["note"]) <= 150
+    set_embed = inter_set.followup.send.call_args.kwargs["embed"]
+    assert len(set_embed.title) <= 256
+    for f in set_embed.fields:
+        assert len(f.name) <= 256
+        assert len(f.value) <= 1024
+
+    # 2. /alert set error and /price error with 3000-char symbol stay <= 2000 chars
+    mock_engine.create_user_alert = AsyncMock(return_value=(False, f"Hata: {oversized_symbol}", None))
+    inter_set_err = _make_mock_interaction(user_id=111)
+    await alert_group.get_command("set").callback(inter_set_err, symbol=oversized_symbol, target_price="72000")
+    assert len(inter_set_err.followup.send.call_args.kwargs["content"]) <= 2000
+
+    inter_price_err = _make_mock_interaction(user_id=111)
+    await bot.tree.get_command("price").callback(inter_price_err, symbol=oversized_symbol)
+    assert len(inter_price_err.followup.send.call_args.kwargs["content"]) <= 2000
+
+    # 3. Legacy 1500-char DB note in /alert list and dispatch_alert_notification stays strictly <= 1024 chars
+    inter_list = _make_mock_interaction(user_id=111)
+    await alert_group.get_command("list").callback(inter_list, status="ACTIVE")
+    list_embed = inter_list.followup.send.call_args.kwargs["embed"]
+    for f in list_embed.fields:
+        assert len(f.name) <= 256
+        assert len(f.value) <= 1024
+
+    fake_channel = MagicMock()
+    fake_channel.send = AsyncMock()
+    with patch.object(bot, "is_closed", return_value=False), \
+         patch.object(bot, "is_ready", return_value=True), \
+         patch.object(bot, "get_channel", return_value=fake_channel):
+        delivered = await bot.dispatch_alert_notification(legacy_record, 73000.0)
+        assert delivered is True
+        sent_embed = fake_channel.send.call_args.kwargs["embed"]
+        assert len(sent_embed.title) <= 256
+        assert len(sent_embed.description) <= 4096
+        for f in sent_embed.fields:
+            assert len(f.name) <= 256
+            assert len(f.value) <= 1024
+
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_rearm_modal_truncates_oversized_alert_notes(tmp_path):
+    """F-2d63a0765cef: RearmAlertModal truncates alert.note default to max_length=150."""
+    from app.bot.client import RearmAlertModal
+    from app.database.db import AlertDatabase
+    from app.services.alert_engine import AutonomousAlertEngine
+
+    # 1. Direct AlertRecord with 200-char note and 145-char + percentage suffix note
+    for raw_note in ("A" * 200, ("B" * 145) + " (+5% hedefi)"):
+        rec = AlertRecord(
+            id=1,
+            user_id="111",
+            user_name="Trader",
+            channel_id="222",
+            guild_id=None,
+            symbol="BTCUSDT",
+            asset_type="CRYPTO",
+            target_price=72000.0,
+            initial_price=68000.0,
+            direction="ABOVE",
+            status="TRIGGERED",
+            created_at="2026-10-29T20:00:00+00:00",
+            note=raw_note,
+        )
+        modal = RearmAlertModal(MagicMock(), rec)
+        assert modal.note.default == raw_note[:150]
+        assert len(modal.note.default) <= 150
+
+    # 2. Integration with create_user_alert appending '(+5% hedefi)'
+    db = AlertDatabase(str(tmp_path / "rearm_note.db"))
+    await db.init_db()
+    feed = MagicMock()
+    feed.get_current_price = AsyncMock(return_value=68000.0)
+    feed.add_listener = MagicMock()
+    feed.set_active_equity_supplier = MagicMock()
+    engine = AutonomousAlertEngine(db=db, price_feed=feed, settings=Settings())
+
+    ok, _, created = await engine.create_user_alert(
+        user_id="111",
+        user_name="Trader",
+        channel_id="222",
+        guild_id=None,
+        raw_symbol="BTCUSDT",
+        target_price="+5%",
+        note="C" * 145,
+    )
+    assert ok is True and created is not None
+    modal_int = RearmAlertModal(engine, created)
+    assert len(modal_int.note.default) <= 150
+    assert modal_int.note.default == created.note[:150]
+
+
+@pytest.mark.asyncio
+async def test_list_alerts_skips_inactive_dedupes_and_fetches_concurrently():
+    """RES-BOT-002: /alert list skips non-ACTIVE lookups, dedupes symbols, bounds concurrency, and isolates errors."""
+    import asyncio
+    from app.bot.client import WATCHLIST_FETCH_CONCURRENCY
+
+    # 1. Non-ACTIVE alerts never invoke feed.get_current_price
+    inactive_alerts = [
+        AlertRecord(
+            id=idx,
+            user_id="111",
+            user_name="Trader",
+            channel_id="222",
+            guild_id=None,
+            symbol=f"SYM{idx}",
+            asset_type="CRYPTO",
+            target_price=100.0,
+            initial_price=90.0,
+            direction="ABOVE",
+            status=st,
+            created_at="2026-10-29T20:00:00+00:00",
+        )
+        for idx, st in enumerate(("TRIGGERED", "CANCELLED", "EXPIRED"), start=1)
+    ]
+
+    mock_engine = MagicMock()
+    mock_engine.db = MagicMock()
+    mock_engine.db.get_user_alerts = AsyncMock(return_value=inactive_alerts)
+    mock_engine.feed = MagicMock()
+    mock_engine.feed.get_current_price = AsyncMock(return_value=95.0)
+
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    bot._register_commands()
+    list_cmd = bot.tree.get_command("alert").get_command("list")
+
+    inter_inactive = _make_mock_interaction(user_id=111)
+    await list_cmd.callback(inter_inactive, status="ALL")
+    mock_engine.feed.get_current_price.assert_not_awaited()
+    assert len(inter_inactive.followup.send.call_args.kwargs["embed"].fields) == 3
+
+    # 2. 15 ACTIVE alerts across 10 distinct symbols (5 duplicates), 1 symbol raises RuntimeError
+    active_symbols = [f"COIN{i}USDT" for i in range(10)] + [f"COIN{i}USDT" for i in range(5)]
+    active_alerts = [
+        AlertRecord(
+            id=100 + idx,
+            user_id="111",
+            user_name="Trader",
+            channel_id="222",
+            guild_id=None,
+            symbol=sym,
+            asset_type="CRYPTO",
+            target_price=120.0,
+            initial_price=100.0,
+            direction="ABOVE",
+            status="ACTIVE",
+            created_at="2026-10-29T20:00:00+00:00",
+        )
+        for idx, sym in enumerate(active_symbols)
+    ]
+
+    in_flight = 0
+    peak_in_flight = 0
+    fetched = []
+
+    async def fake_price(sym: str):
+        nonlocal in_flight, peak_in_flight
+        fetched.append(sym)
+        in_flight += 1
+        peak_in_flight = max(peak_in_flight, in_flight)
+        await asyncio.sleep(0.02)
+        in_flight -= 1
+        if sym == "COIN3USDT":
+            raise RuntimeError("Upstream error")
+        return 110.0
+
+    mock_engine.db.get_user_alerts = AsyncMock(return_value=active_alerts)
+    mock_engine.feed.get_current_price = fake_price
+
+    inter_active = _make_mock_interaction(user_id=111)
+    await list_cmd.callback(inter_active, status="ACTIVE")
+    embed = inter_active.followup.send.call_args.kwargs["embed"]
+    assert len(embed.fields) == 15
+    assert len(fetched) == 10
+    assert len(set(fetched)) == 10
+    assert 1 < peak_in_flight <= WATCHLIST_FETCH_CONCURRENCY
+
+    await bot.close()
+
+
+def test_format_price_handles_zero_sub_1e8_and_nonfinite():
+    """LOGIC-FORMAT-003: format_price never emits malformed '$0.' for zero, sub-1e-8, or non-finite values."""
+    from app.bot.client import format_price
+
+    assert format_price(0.0) == "$0.00"
+    assert format_price(1e-9) == "$0.000000001"
+    assert not format_price(1e-9).endswith(".")
+    assert not format_price(1e-15).endswith(".")
+    assert format_price(0.00001230) == "$0.0000123"
+    assert format_price(1.5) == "$1.5000"
+    assert format_price(68450.5) == "$68,450.50"
+    assert format_price(None) == "*Alınamadı*"
+    assert format_price(float("nan")) == "*Alınamadı*"
+    assert format_price(float("inf")) == "*Alınamadı*"
+    assert format_price(float("-inf")) == "*Alınamadı*"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_alert_notification_dm_retry_fallback_and_channel_failures():
+    """V6-COVERAGE-001: Cover DM success, DM transient retry, DM->channel fallback, fetch_channel error, and channel retry exhaustion."""
+    import aiohttp
+
+    mock_engine = MagicMock()
+    settings = Settings(DISCORD_BOT_TOKEN="mock_token", DISCORD_ALERT_CHANNEL_ID=12345)
+    bot = DiscordAlertBot(engine=mock_engine, settings=settings)
+
+    dm_alert = AlertRecord(
+        id=201,
+        user_id="111",
+        user_name="Trader",
+        channel_id="12345",
+        guild_id=None,
+        symbol="BTCUSDT",
+        asset_type="CRYPTO",
+        target_price=70000.0,
+        initial_price=65000.0,
+        direction="ABOVE",
+        status="TRIGGERED",
+        created_at="2026-10-29T20:00:00+00:00",
+        notify_dm=True,
+    )
+    ch_alert = AlertRecord(
+        id=202,
+        user_id="111",
+        user_name="Trader",
+        channel_id="12345",
+        guild_id=None,
+        symbol="ETHUSDT",
+        asset_type="CRYPTO",
+        target_price=3500.0,
+        initial_price=3200.0,
+        direction="ABOVE",
+        status="TRIGGERED",
+        created_at="2026-10-29T20:00:00+00:00",
+        notify_dm=False,
+    )
+
+    with patch.object(bot, "is_closed", return_value=False), \
+         patch.object(bot, "is_ready", return_value=True), \
+         patch("app.bot.client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+
+        # (a) notify_dm=True happy path delivers via user.send without calling channel.send
+        dm_user = MagicMock()
+        dm_user.send = AsyncMock()
+        ch_unused = MagicMock()
+        ch_unused.send = AsyncMock()
+        with patch.object(bot, "get_user", return_value=dm_user), \
+             patch.object(bot, "get_channel", return_value=ch_unused):
+            assert await bot.dispatch_alert_notification(dm_alert, 70500.0) is True
+            dm_user.send.assert_awaited_once()
+            ch_unused.send.assert_not_awaited()
+
+        # (b) notify_dm=True transient aiohttp.ClientError retries and succeeds on attempt 2
+        dm_attempts = 0
+
+        async def flaky_dm_send(**kwargs):
+            nonlocal dm_attempts
+            dm_attempts += 1
+            if dm_attempts == 1:
+                raise aiohttp.ClientError("transient proxy error")
+
+        flaky_user = MagicMock()
+        flaky_user.send = AsyncMock(side_effect=flaky_dm_send)
+        mock_sleep.reset_mock()
+        with patch.object(bot, "get_user", return_value=flaky_user), \
+             patch.object(bot, "get_channel", return_value=ch_unused):
+            assert await bot.dispatch_alert_notification(dm_alert, 70500.0) is True
+            assert dm_attempts == 2
+            assert mock_sleep.await_count == 1
+            ch_unused.send.assert_not_awaited()
+
+        # (c) notify_dm=True non-retryable failure (e.g., DM blocked / Forbidden) falls back to channel.send
+        blocked_user = MagicMock()
+        blocked_user.send = AsyncMock(side_effect=RuntimeError("Forbidden: Cannot send messages to this user"))
+        fallback_channel = MagicMock()
+        fallback_channel.send = AsyncMock()
+        with patch.object(bot, "get_user", return_value=blocked_user), \
+             patch.object(bot, "get_channel", return_value=fallback_channel):
+            assert await bot.dispatch_alert_notification(dm_alert, 70500.0) is True
+            blocked_user.send.assert_awaited_once()
+            fallback_channel.send.assert_awaited_once()
+
+        # (d) get_channel returning None + fetch_channel raising returns False
+        with patch.object(bot, "get_channel", return_value=None), \
+             patch.object(bot, "fetch_channel", new_callable=AsyncMock, side_effect=RuntimeError("Not Found")):
+            assert await bot.dispatch_alert_notification(ch_alert, 3600.0) is False
+
+        # (e) channel.send failing all 3 aiohttp.ClientError attempts returns False with 2 sleeps
+        failing_channel = MagicMock()
+        failing_channel.send = AsyncMock(side_effect=aiohttp.ClientError("gateway down"))
+        mock_sleep.reset_mock()
+        with patch.object(bot, "get_channel", return_value=failing_channel):
+            assert await bot.dispatch_alert_notification(ch_alert, 3600.0) is False
+            assert failing_channel.send.await_count == 3
+            assert mock_sleep.await_count == 2
+
+    await bot.close()

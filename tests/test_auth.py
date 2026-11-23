@@ -145,3 +145,18 @@ def test_webhook_rejects_oversized_body_before_parsing(client: TestClient, monke
     r5 = client.post("/webhook", content=oversized, headers={"X-Webhook-Secret": "wrong"})
     assert r5.status_code == 401
     parse_spy.assert_not_called()
+
+
+def test_webhook_returns_503_when_queue_is_full(client: TestClient, monkeypatch):
+    """V6-COVERAGE-001: Full AlertQueueService causes POST /webhook and POST /webhook/{token} to return HTTP 503."""
+    from unittest.mock import MagicMock
+
+    queue_service = client.app.state.queue_service
+    monkeypatch.setattr(queue_service, "enqueue", MagicMock(return_value=False))
+
+    payload = {"ticker": "BTCUSDT", "action": "BUY", "price": 67000.0, "passphrase": TEST_SECRET}
+    r_root = client.post("/webhook", json=payload)
+    assert r_root.status_code == 503
+
+    r_path = client.post(f"/webhook/{TEST_SECRET}", json={"ticker": "ETHUSDT", "action": "SELL", "price": 3400.0})
+    assert r_path.status_code == 503

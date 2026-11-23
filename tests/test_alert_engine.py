@@ -427,3 +427,136 @@ async def test_non_finite_and_invalid_prices_rejected(setup_engine):
     assert ok_zero is False
     assert rec_zero is None
     assert await engine.db.count_active_alerts() == 0
+
+
+@pytest.mark.asyncio
+async def test_on_price_tick_ignores_zero_negative_and_nonfinite_prices(setup_engine):
+    """DATA-VALID-001: _on_price_tick never triggers BELOW/ABOVE alerts on 0, negative, NaN, or Inf ticks."""
+    engine, triggered, _ = setup_engine
+
+    ok_below, _, rec_below = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price=60000.0,
+    )
+    ok_above, _, rec_above = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price=70000.0,
+    )
+    assert ok_below and ok_above
+
+    for bad_tick in (0.0, -1.0, float("nan"), float("inf"), float("-inf")):
+        await engine._on_price_tick("BTCUSDT", bad_tick)
+
+    assert triggered == []
+    assert (await engine.db.get_alert_by_id(rec_below.id)).status == "ACTIVE"
+    assert (await engine.db.get_alert_by_id(rec_above.id)).status == "ACTIVE"
+
+    # Happy path: valid finite positive tick triggers BELOW alert normally
+    await engine._on_price_tick("BTCUSDT", 59999.0)
+    assert len(triggered) == 1
+    assert triggered[0][0].id == rec_below.id
+    assert (await engine.db.get_alert_by_id(rec_below.id)).status == "TRIGGERED"
+    assert (await engine.db.get_alert_by_id(rec_above.id)).status == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_logic_engine_002_rejects_bool_and_zero_ticks(setup_engine):
+    """LOGIC-ENGINE-002: _on_price_tick rejects bool, <=0, and non-finite values; valid ticks fire once."""
+    engine, triggered, _ = setup_engine
+
+    ok_below, _, rec_below = await engine.create_user_alert(
+        user_id="u2", user_name="Tester", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price=60000.0,
+    )
+    assert ok_below
+
+    for bad_tick in (0.0, -5.0, float("nan"), float("inf"), float("-inf"), True, False):
+        await engine._on_price_tick("BTCUSDT", bad_tick)
+    assert triggered == []
+    assert (await engine.db.get_alert_by_id(rec_below.id)).status == "ACTIVE"
+
+    await engine._on_price_tick("BTCUSDT", 59999.0)
+    assert len(triggered) == 1
+    assert triggered[0][0].id == rec_below.id
+    # Subsequent duplicate tick must not re-fire
+    await engine._on_price_tick("BTCUSDT", 59998.0)
+    assert len(triggered) == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_active_symbols_does_not_overwrite_concurrent_mutations(setup_engine):
+    """F-1b85df3e0731: Stalled _refresh_active_symbols never drops concurrently added or reset symbols."""
+    import asyncio
+
+    engine, triggered, feed = setup_engine
+    feed.mock_prices["ETHUSDT"] = 3000.0
+    feed.mock_prices["SOLUSDT"] = 150.0
+
+    # Create a BTCUSDT alert and a SOLUSDT alert, then mark SOLUSDT as TRIGGERED
+    ok_btc, _, rec_btc = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price=70000.0,
+    )
+    ok_sol, _, rec_sol = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="SOLUSDT", target_price=160.0,
+    )
+    assert ok_btc and ok_sol
+    assert await engine.db.trigger_alert(rec_sol.id) is True
+    await engine._refresh_active_symbols()
+    assert engine._active_symbols == {"BTCUSDT"}
+
+    orig_get_active = engine.db.get_active_alerts
+    stalled_entered = asyncio.Event()
+    release_stall = asyncio.Event()
+    stalled_once = False
+
+    async def stalled_get_active(*args, **kwargs):
+        nonlocal stalled_once
+        result = await orig_get_active(*args, **kwargs)
+        # Only stall the first full-table refresh call (symbol is None)
+        if not stalled_once and not args and kwargs.get("symbol") is None:
+            stalled_once = True
+            stalled_entered.set()
+            await release_stall.wait()
+        return result
+
+    engine.db.get_active_alerts = stalled_get_active
+
+    # Start a refresh that reads only {BTCUSDT} then stalls before updating self._active_symbols
+    refresh_task = asyncio.create_task(engine._refresh_active_symbols())
+    await asyncio.wait_for(stalled_entered.wait(), timeout=2.0)
+
+    # While refresh_task is stalled, concurrently add ETHUSDT and reset SOLUSDT to ACTIVE
+    ok_eth, _, rec_eth = await engine.create_user_alert(
+        user_id="u1", user_name="Pax", channel_id="c1", guild_id="g1",
+        raw_symbol="ETHUSDT", target_price=3500.0,
+    )
+    assert ok_eth
+    assert await engine.db.reset_alert_to_active(rec_sol.id) is True
+
+    # Release the stale refresh; it must detect the version bump and re-read fresh state
+    release_stall.set()
+    await asyncio.wait_for(refresh_task, timeout=2.0)
+
+    assert engine._active_symbols == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+
+    # Verify ticks for both newly added ETHUSDT and reset SOLUSDT trigger normally
+    await engine._on_price_tick("ETHUSDT", 3600.0)
+    await engine._on_price_tick("SOLUSDT", 170.0)
+    triggered_ids = {rec.id for rec, _ in triggered}
+    assert rec_eth.id in triggered_ids
+    assert rec_sol.id in triggered_ids
+
+    # Concurrent cancel/clear/create operations must complete without deadlocking _create_lock
+    results = await asyncio.gather(
+        engine.db.cancel_alert(rec_btc.id, "u1"),
+        engine.create_user_alert(
+            user_id="u2", user_name="User2", channel_id="c1", guild_id="g1",
+            raw_symbol="BTCUSDT", target_price=72000.0,
+        ),
+        engine.db.clear_user_alerts("u1"),
+        engine.db.expire_stale_alerts(30),
+    )
+    assert results[1][0] is True
+    assert "BTCUSDT" in engine._active_symbols

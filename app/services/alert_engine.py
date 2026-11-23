@@ -91,6 +91,7 @@ class AutonomousAlertEngine:
         self._running = False
         self._expiry_task: Optional[asyncio.Task] = None
         self._active_symbols: Optional[Set[str]] = None
+        self._active_symbols_version: int = 0
         self._create_lock: Optional[asyncio.Lock] = None
         self._create_lock_loop: Optional[asyncio.AbstractEventLoop] = None
         self._hook_db_mutations()
@@ -108,10 +109,17 @@ class AutonomousAlertEngine:
         return self._create_lock
 
     async def _refresh_active_symbols(self) -> Set[str]:
-        """Synchronize the in-memory set of symbols that currently have ACTIVE alerts."""
-        active = await self.db.get_active_alerts()
-        self._active_symbols = {a.symbol.upper().strip() for a in active}
-        return self._active_symbols
+        """Synchronize the in-memory set of symbols that currently have ACTIVE alerts.
+
+        Uses a monotonic mutation version counter so a stale SELECT snapshot can never
+        overwrite concurrent add/reset/cancel/trigger/clear/expire mutations.
+        """
+        while True:
+            version_before = self._active_symbols_version
+            active = await self.db.get_active_alerts()
+            if self._active_symbols_version == version_before:
+                self._active_symbols = {a.symbol.upper().strip() for a in active}
+                return self._active_symbols
 
     def _hook_db_mutations(self) -> None:
         """Keep _active_symbols synchronized even when callers mutate self.db directly."""
@@ -127,6 +135,7 @@ class AutonomousAlertEngine:
 
         async def _wrapped_add(*args, **kwargs):
             alert_id = await orig_add(*args, **kwargs)
+            self._active_symbols_version += 1
             symbol = kwargs.get("symbol") if "symbol" in kwargs else (args[4] if len(args) > 4 else None)
             if symbol is not None and self._active_symbols is not None:
                 self._active_symbols.add(str(symbol).upper().strip())
@@ -134,32 +143,42 @@ class AutonomousAlertEngine:
 
         async def _wrapped_trigger(*args, **kwargs):
             res = await orig_trigger(*args, **kwargs)
-            if res and self._active_symbols is not None:
-                await self._refresh_active_symbols()
+            if res:
+                self._active_symbols_version += 1
+                if self._active_symbols is not None:
+                    await self._refresh_active_symbols()
             return res
 
         async def _wrapped_reset(*args, **kwargs):
             res = await orig_reset(*args, **kwargs)
-            if res and self._active_symbols is not None:
-                await self._refresh_active_symbols()
+            if res:
+                self._active_symbols_version += 1
+                if self._active_symbols is not None:
+                    await self._refresh_active_symbols()
             return res
 
         async def _wrapped_cancel(*args, **kwargs):
             res = await orig_cancel(*args, **kwargs)
-            if res and self._active_symbols is not None:
-                await self._refresh_active_symbols()
+            if res:
+                self._active_symbols_version += 1
+                if self._active_symbols is not None:
+                    await self._refresh_active_symbols()
             return res
 
         async def _wrapped_clear(*args, **kwargs):
             count = await orig_clear(*args, **kwargs)
-            if count and self._active_symbols is not None:
-                await self._refresh_active_symbols()
+            if count:
+                self._active_symbols_version += 1
+                if self._active_symbols is not None:
+                    await self._refresh_active_symbols()
             return count
 
         async def _wrapped_expire(*args, **kwargs):
             count = await orig_expire(*args, **kwargs)
-            if count and self._active_symbols is not None:
-                await self._refresh_active_symbols()
+            if count:
+                self._active_symbols_version += 1
+                if self._active_symbols is not None:
+                    await self._refresh_active_symbols()
             return count
 
         self.db.add_alert = _wrapped_add
@@ -193,6 +212,14 @@ class AutonomousAlertEngine:
 
     async def _on_price_tick(self, symbol: str, current_price: float) -> None:
         """Evaluate active alerts when a price tick arrives."""
+        if (
+            isinstance(current_price, bool)
+            or not isinstance(current_price, (int, float))
+            or not math.isfinite(current_price)
+            or current_price <= 0
+        ):
+            logger.debug("Ignoring non-positive or non-finite price tick %r for symbol %s", current_price, symbol)
+            return
         if not self._is_callback_ready():
             return
         norm_symbol = symbol.upper().strip()

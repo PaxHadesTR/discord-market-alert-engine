@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+import math
+import re
 import time
 from typing import Any, Dict, Tuple
 from fastapi import APIRouter, Request, status
@@ -6,6 +8,18 @@ from fastapi.responses import JSONResponse
 from app.config import get_settings
 
 router = APIRouter(tags=["Health"])
+
+_URL_USERINFO_RE = re.compile(r"(://)([^@\s/]+)@")
+
+
+def _redact_sensitive_text(value: Any, max_length: int = 240) -> str:
+    """Mask embedded URL credentials and normalize single-line error text for public health endpoints."""
+    text = str(value)
+    text = _URL_USERINFO_RE.sub(r"\1***@", text)
+    text = " ".join(text.splitlines()).strip()
+    if len(text) > max_length:
+        text = text[: max_length - 3].rstrip() + "..."
+    return text
 
 
 def check_bot_health(request: Request) -> Tuple[bool, str, Dict[str, Any]]:
@@ -40,13 +54,27 @@ def check_bot_health(request: Request) -> Tuple[bool, str, Dict[str, Any]]:
             "configured": True,
             "supervisor_alive": False,
             "ready": False,
-            "reason": f"Supervisor task died: {exc}" if exc else "Supervisor task terminated",
+            "reason": (
+                f"Supervisor task died: {_redact_sensitive_text(exc)}"
+                if exc
+                else "Supervisor task terminated"
+            ),
         }
 
     # 2. Check bot ready state
     is_ready = bool(bot and not bot.is_closed() and bot.is_ready())
     if is_ready:
-        latency_ms = round(bot.latency * 1000, 1) if (bot and bot.latency) else 0.0
+        raw_latency = getattr(bot, "latency", None)
+        latency_ms = (
+            round(raw_latency * 1000, 1)
+            if (
+                isinstance(raw_latency, (int, float))
+                and not isinstance(raw_latency, bool)
+                and math.isfinite(raw_latency)
+                and raw_latency >= 0
+            )
+            else 0.0
+        )
         return True, "healthy", {
             "configured": True,
             "supervisor_alive": True,
@@ -80,10 +108,10 @@ def check_bot_health(request: Request) -> Tuple[bool, str, Dict[str, Any]]:
     }
     last_error = getattr(request.app.state, "discord_bot_last_error", None)
     if last_error:
-        details["last_error"] = last_error
+        details["last_error"] = _redact_sensitive_text(last_error)
     active_proxy = getattr(request.app.state, "discord_bot_active_proxy", None)
     if active_proxy is not None:
-        details["active_proxy"] = active_proxy
+        details["active_proxy"] = _redact_sensitive_text(active_proxy)
     proxy_failures = getattr(request.app.state, "discord_bot_proxy_failures", 0)
     if proxy_failures:
         details["proxy_failures"] = proxy_failures

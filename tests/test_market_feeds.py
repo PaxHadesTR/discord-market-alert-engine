@@ -266,3 +266,91 @@ async def test_binance_rest_fetch_price_happy_and_error_paths():
     assert await feed.fetch_price("INVALID") is None
 
     await feed.stop()
+
+
+@pytest.mark.asyncio
+async def test_unified_feed_crypto_routing_and_none_cache_behavior():
+    """V6-COVERAGE-002: UnifiedPriceFeed routes CRYPTO to binance, caches valid quotes, and never caches None."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    binance = MagicMock()
+    binance.fetch_price = AsyncMock(return_value=68500.0)
+    yahoo = MagicMock()
+    yahoo.fetch_price = AsyncMock(return_value=210.0)
+
+    feed = UnifiedPriceFeed(binance_feed=binance, yahoo_feed=yahoo, cache_ttl_seconds=20.0)
+
+    # (a) CRYPTO symbol ('BTC' -> 'BTCUSDT') routes to binance.fetch_price (not yahoo) and caches result
+    price = await feed.get_current_price("BTC")
+    assert price == 68500.0
+    binance.fetch_price.assert_awaited_once_with("BTCUSDT")
+    yahoo.fetch_price.assert_not_awaited()
+    assert feed.price_cache["BTCUSDT"][0] == 68500.0
+
+    # Cached hit avoids a second network call
+    assert await feed.get_current_price("btc") == 68500.0
+    assert binance.fetch_price.await_count == 1
+
+    # (b) None from binance or yahoo does not populate cache and does not overwrite an expired entry with None
+    binance.fetch_price = AsyncMock(return_value=None)
+    assert await feed.get_current_price("ETH") is None
+    assert "ETHUSDT" not in feed.price_cache
+
+    # Expire existing BTCUSDT entry and ensure None does not overwrite it
+    feed.price_cache["BTCUSDT"] = (68500.0, time.time() - 60.0)
+    assert await feed.get_current_price("BTCUSDT") is None
+    assert feed.price_cache["BTCUSDT"][0] == 68500.0
+
+    yahoo.fetch_price = AsyncMock(return_value=None)
+    assert await feed.get_current_price("AAPL") is None
+    assert "AAPL" not in feed.price_cache
+
+
+@pytest.mark.asyncio
+async def test_binance_ws_loop_reconnect_backoff_escalates_and_resets():
+    """V6-COVERAGE-002: BinanceMarketFeed._ws_loop escalates backoff (2.0 -> 3.0), delivers ticks, and resets backoff to 2.0 on reconnect."""
+    attempts = 0
+    sleep_delays = []
+    received_ticks = []
+    binance = BinanceMarketFeed()
+    binance._running = True
+
+    class _FakeWS:
+        def __init__(self, frames_to_emit):
+            self._frames = list(frames_to_emit)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def recv(self):
+            if self._frames:
+                return self._frames.pop(0)
+            raise ConnectionError("post-recovery drop")
+
+    def fake_connect(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts in (1, 2):
+            raise ConnectionError(f"connect failed #{attempts}")
+        if attempts == 3:
+            return _FakeWS([json.dumps({"s": "BTCUSDT", "c": "69100.5"})])
+        # Stop cleanly after observing the post-recovery backoff reset
+        binance._running = False
+        raise asyncio.CancelledError
+
+    async def fake_sleep(delay: float):
+        sleep_delays.append(delay)
+
+    async def on_tick(sym: str, price: float):
+        received_ticks.append((sym, price))
+
+    with patch("app.market_data.binance.websockets.connect", side_effect=fake_connect), \
+         patch("app.market_data.binance.asyncio.sleep", side_effect=fake_sleep):
+        await binance._ws_loop(on_tick)
+
+    assert received_ticks == [("BTCUSDT", 69100.5)]
+    # First two connect errors escalate 2.0 -> 3.0; after attempt 3 succeeds & drops, backoff resets to 2.0
+    assert sleep_delays == [2.0, 3.0, 2.0]

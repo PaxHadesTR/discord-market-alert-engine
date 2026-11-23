@@ -997,4 +997,107 @@ def test_docker_compose_warp_sidecar_prevents_503_regressions():
     assert "willfarrell/autoheal:latest" in content
 
 
+@pytest.mark.asyncio
+async def test_health_endpoints_redact_proxy_credentials_and_preserve_diagnostics(monkeypatch):
+    """F-5686571cd564: /healthz and /live redact proxy userinfo while preserving error class/status & host."""
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "valid_token_abc_123")
+    get_settings.cache_clear()
+
+    app = create_app()
+    running_task = asyncio.create_task(asyncio.sleep(30))
+    try:
+        mock_bot = MagicMock()
+        mock_bot.is_closed.return_value = True
+        mock_bot.is_ready.return_value = False
+
+        app.state.discord_bot = mock_bot
+        app.state.discord_bot_task = running_task
+        app.state.app_start_time = time.time() - 60.0
+        app.state.discord_bot_active_proxy = "http://secretuser:secretpass@proxy.internal:8080"
+        app.state.discord_bot_last_error = (
+            "ClientHttpProxyError: 503, message='Service Unavailable', "
+            "url='http://secretuser:secretpass@proxy.internal:8080'\nTraceback line"
+        )
+        app.state.discord_bot_proxy_failures = 3
+
+        client = TestClient(app)
+
+        for endpoint, detail_key in (("/healthz", "discord_bot"), ("/live", "details")):
+            resp = client.get(endpoint)
+            assert resp.status_code == 503
+            body_text = resp.text
+            assert "secretuser" not in body_text
+            assert "secretpass" not in body_text
+            details = resp.json()[detail_key]
+            assert details["active_proxy"] == "http://***@proxy.internal:8080"
+            assert "ClientHttpProxyError" in details["last_error"]
+            assert "503" in details["last_error"]
+            assert "http://***@proxy.internal:8080" in details["last_error"]
+
+        # Happy path: credential-less proxy URL remains intact
+        app.state.discord_bot_active_proxy = "http://warp:1080"
+        resp_plain = client.get("/healthz")
+        assert resp_plain.status_code == 503
+        assert resp_plain.json()["discord_bot"]["active_proxy"] == "http://warp:1080"
+    finally:
+        running_task.cancel()
+        try:
+            await running_task
+        except asyncio.CancelledError:
+            pass
+
+    # Supervisor dead exception must also redact embedded credentials
+    async def _boom():
+        raise RuntimeError("Proxy failed at http://admin:topsecret@proxy.internal:8080")
+
+    dead_task = asyncio.create_task(_boom())
+    with pytest.raises(RuntimeError):
+        await dead_task
+
+    app.state.discord_bot_task = dead_task
+    client = TestClient(app)
+    dead_resp = client.get("/healthz")
+    assert dead_resp.status_code == 503
+    assert "admin" not in dead_resp.text
+    assert "topsecret" not in dead_resp.text
+    assert "http://***@proxy.internal:8080" in dead_resp.json()["discord_bot"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_healthz_handles_nonfinite_and_negative_bot_latency(monkeypatch):
+    """RES-HEALTH-001: NaN/Inf/-Inf/negative/None bot.latency must return 200 with latency_ms == 0.0."""
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "valid_token_abc_123")
+    get_settings.cache_clear()
+
+    app = create_app()
+    running_task = asyncio.create_task(asyncio.sleep(30))
+    try:
+        mock_bot = MagicMock()
+        mock_bot.is_closed.return_value = False
+        mock_bot.is_ready.return_value = True
+        mock_bot.user = "AlertBot#1234"
+
+        app.state.discord_bot = mock_bot
+        app.state.discord_bot_task = running_task
+        client = TestClient(app)
+
+        for bad_latency in (float("nan"), float("inf"), float("-inf"), -1.0, None, True):
+            mock_bot.latency = bad_latency
+            resp = client.get("/healthz")
+            assert resp.status_code == 200
+            assert resp.json()["discord_bot"]["latency_ms"] == 0.0
+
+        # Happy path
+        mock_bot.latency = 0.0425
+        resp_ok = client.get("/healthz")
+        assert resp_ok.status_code == 200
+        assert resp_ok.json()["discord_bot"]["latency_ms"] == 42.5
+    finally:
+        running_task.cancel()
+        try:
+            await running_task
+        except asyncio.CancelledError:
+            pass
+
+
 

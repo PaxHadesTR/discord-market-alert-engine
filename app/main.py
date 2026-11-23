@@ -32,6 +32,26 @@ logging.getLogger("discord.gateway").setLevel(logging.INFO)
 logging.getLogger("discord.client").setLevel(logging.INFO)
 logger = logging.getLogger("tradingview_alerts")
 
+_PLACEHOLDER_WEBHOOK_URLS = {
+    "https://discord.com/api/webhooks/your/webhook/url/here",
+    "https://discord.com/api/webhooks/id/token",
+    "https://discordapp.com/api/webhooks/your/webhook/url/here",
+    "https://discordapp.com/api/webhooks/id/token",
+    "your_discord_webhook_url_here",
+    "buraya_webhook_url",
+}
+
+
+def is_valid_discord_webhook_url(webhook_url: Optional[str]) -> bool:
+    """Return True when DISCORD_WEBHOOK_URL is a real HTTP(S) URL rather than a sample placeholder."""
+    cleaned = (webhook_url or "").strip().strip('"').strip("'")
+    if not cleaned:
+        return False
+    lowered = cleaned.lower().rstrip("/")
+    if lowered in _PLACEHOLDER_WEBHOOK_URLS:
+        return False
+    return lowered.startswith("https://") or lowered.startswith("http://")
+
 
 def is_proxy_connection_error(exc: BaseException) -> bool:
     """Return True if the exception represents an outbound proxy/tunnel/transport failure.
@@ -71,14 +91,19 @@ async def lifespan(app: FastAPI):
 
     # 1. Initialize Webhook Queue Infrastructure (TradingView Forwarding)
     providers: List[BaseNotificationProvider] = []
-    if settings.DISCORD_WEBHOOK_URL:
+    has_valid_webhook = is_valid_discord_webhook_url(settings.DISCORD_WEBHOOK_URL)
+    if has_valid_webhook:
         discord_provider = DiscordWebhookProvider(
-            webhook_url=settings.DISCORD_WEBHOOK_URL,
+            webhook_url=(settings.DISCORD_WEBHOOK_URL or "").strip().strip('"').strip("'"),
             bot_username=settings.DISCORD_BOT_USERNAME,
             avatar_url=settings.DISCORD_AVATAR_URL,
             timeout_seconds=settings.HTTP_TIMEOUT_SECONDS,
         )
         providers.append(discord_provider)
+    elif (settings.DISCORD_WEBHOOK_URL or "").strip():
+        logger.warning(
+            "Ignoring placeholder or invalid DISCORD_WEBHOOK_URL; falling back to Discord Bot provider if DISCORD_ALERT_CHANNEL_ID is configured."
+        )
 
     rate_limiter = AsyncTokenBucket(rate=settings.RATE_LIMIT_PER_SECOND)
     queue_service = AlertQueueService(
@@ -133,8 +158,9 @@ async def lifespan(app: FastAPI):
 
     token = (settings.DISCORD_BOT_TOKEN or "").strip().strip('"').strip("'")
     if settings.is_discord_bot_configured:
-        # If no separate DISCORD_WEBHOOK_URL was configured, use the active Discord Bot to dispatch TradingView alerts!
-        if not settings.DISCORD_WEBHOOK_URL and settings.DISCORD_ALERT_CHANNEL_ID:
+        # If no valid DISCORD_WEBHOOK_URL was configured, use the active Discord Bot to dispatch TradingView alerts
+        # (requires DISCORD_ALERT_CHANNEL_ID to be set).
+        if not has_valid_webhook and settings.DISCORD_ALERT_CHANNEL_ID:
             bot_provider = DiscordBotNotificationProvider(
                 bot=None,
                 channel_id=settings.DISCORD_ALERT_CHANNEL_ID,
@@ -144,6 +170,15 @@ async def lifespan(app: FastAPI):
                 "Attached Discord Bot provider to TradingView Webhook Queue (Target Channel: %s)",
                 settings.DISCORD_ALERT_CHANNEL_ID,
             )
+
+    if not queue_service.providers:
+        logger.warning(
+            "No active TradingView webhook notification provider is configured. "
+            "Set a valid DISCORD_WEBHOOK_URL, or configure both DISCORD_BOT_TOKEN and DISCORD_ALERT_CHANNEL_ID "
+            "to enable Discord Bot fallback; incoming /webhook signals will not be forwarded."
+        )
+
+    if settings.is_discord_bot_configured:
 
         async def _run_bot_supervisor():
             backoff_steps = [5.0, 10.0, 30.0, 60.0]
