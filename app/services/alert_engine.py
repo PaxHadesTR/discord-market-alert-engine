@@ -193,7 +193,13 @@ class AutonomousAlertEngine:
 
     async def _on_price_tick(self, symbol: str, current_price: float) -> None:
         """Evaluate active alerts when a price tick arrives."""
-        if not math.isfinite(current_price) or current_price <= 0:
+        if (
+            isinstance(current_price, bool)
+            or not isinstance(current_price, (int, float))
+            or not math.isfinite(current_price)
+            or current_price <= 0
+        ):
+            logger.debug("Ignoring non-positive or non-finite price tick %r for symbol %s", current_price, symbol)
             return
         if not self._is_callback_ready():
             return

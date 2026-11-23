@@ -457,3 +457,27 @@ async def test_on_price_tick_ignores_zero_negative_and_nonfinite_prices(setup_en
     assert triggered[0][0].id == rec_below.id
     assert (await engine.db.get_alert_by_id(rec_below.id)).status == "TRIGGERED"
     assert (await engine.db.get_alert_by_id(rec_above.id)).status == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_logic_engine_002_rejects_bool_and_zero_ticks(setup_engine):
+    """LOGIC-ENGINE-002: _on_price_tick rejects bool, <=0, and non-finite values; valid ticks fire once."""
+    engine, triggered, _ = setup_engine
+
+    ok_below, _, rec_below = await engine.create_user_alert(
+        user_id="u2", user_name="Tester", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price=60000.0,
+    )
+    assert ok_below
+
+    for bad_tick in (0.0, -5.0, float("nan"), float("inf"), float("-inf"), True, False):
+        await engine._on_price_tick("BTCUSDT", bad_tick)
+    assert triggered == []
+    assert (await engine.db.get_alert_by_id(rec_below.id)).status == "ACTIVE"
+
+    await engine._on_price_tick("BTCUSDT", 59999.0)
+    assert len(triggered) == 1
+    assert triggered[0][0].id == rec_below.id
+    # Subsequent duplicate tick must not re-fire
+    await engine._on_price_tick("BTCUSDT", 59998.0)
+    assert len(triggered) == 1
