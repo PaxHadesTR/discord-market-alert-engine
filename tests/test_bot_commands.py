@@ -420,3 +420,105 @@ async def test_slash_commands_and_rearm_modal_happy_paths():
     assert "yeniden aktif edildi" in inter_modal.followup.send.call_args.kwargs["content"]
 
     await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_sec_valid_001_bounds_note_symbol_and_legacy_embed_fields():
+    """SEC-VALID-001: Oversized notes/symbols are clamped and legacy 1500-char DB notes never exceed Discord embed limits."""
+    oversized_note = "N" * 2000
+    oversized_symbol = "S" * 3000
+    legacy_note = "L" * 1500
+
+    legacy_record = AlertRecord(
+        id=88,
+        user_id="111",
+        user_name="Trader",
+        channel_id="222",
+        guild_id=None,
+        symbol="BTCUSDT",
+        asset_type="CRYPTO",
+        target_price=72000.0,
+        initial_price=68000.0,
+        direction="ABOVE",
+        status="ACTIVE",
+        created_at="2026-10-29T20:00:00+00:00",
+        note=legacy_note,
+    )
+
+    captured_create_kwargs = {}
+
+    async def fake_create_user_alert(**kwargs):
+        captured_create_kwargs.update(kwargs)
+        rec = AlertRecord(
+            id=89,
+            user_id=kwargs["user_id"],
+            user_name=kwargs["user_name"],
+            channel_id=kwargs["channel_id"],
+            guild_id=kwargs["guild_id"],
+            symbol=kwargs["raw_symbol"],
+            asset_type="CRYPTO",
+            target_price=72000.0,
+            initial_price=68000.0,
+            direction="ABOVE",
+            status="ACTIVE",
+            created_at="2026-10-29T20:00:00+00:00",
+            note=kwargs["note"],
+        )
+        return True, "OK", rec
+
+    mock_engine = MagicMock()
+    mock_engine.create_user_alert = AsyncMock(side_effect=fake_create_user_alert)
+    mock_engine.db = MagicMock()
+    mock_engine.db.get_user_alerts = AsyncMock(return_value=[legacy_record])
+    mock_engine.feed = MagicMock()
+    mock_engine.feed.get_current_price = AsyncMock(return_value=None)
+
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token", DISCORD_ALERT_CHANNEL_ID=222))
+    bot._register_commands()
+
+    # 1. /alert set truncates 2000-char note to <= 150 chars before DB persistence and bounds embed fields
+    alert_group = bot.tree.get_command("alert")
+    inter_set = _make_mock_interaction(user_id=111)
+    await alert_group.get_command("set").callback(
+        inter_set, symbol="BTCUSDT", target_price="72000", note=oversized_note, dm=False
+    )
+    assert len(captured_create_kwargs["note"]) <= 150
+    set_embed = inter_set.followup.send.call_args.kwargs["embed"]
+    assert len(set_embed.title) <= 256
+    for f in set_embed.fields:
+        assert len(f.name) <= 256
+        assert len(f.value) <= 1024
+
+    # 2. /alert set error and /price error with 3000-char symbol stay <= 2000 chars
+    mock_engine.create_user_alert = AsyncMock(return_value=(False, f"Hata: {oversized_symbol}", None))
+    inter_set_err = _make_mock_interaction(user_id=111)
+    await alert_group.get_command("set").callback(inter_set_err, symbol=oversized_symbol, target_price="72000")
+    assert len(inter_set_err.followup.send.call_args.kwargs["content"]) <= 2000
+
+    inter_price_err = _make_mock_interaction(user_id=111)
+    await bot.tree.get_command("price").callback(inter_price_err, symbol=oversized_symbol)
+    assert len(inter_price_err.followup.send.call_args.kwargs["content"]) <= 2000
+
+    # 3. Legacy 1500-char DB note in /alert list and dispatch_alert_notification stays strictly <= 1024 chars
+    inter_list = _make_mock_interaction(user_id=111)
+    await alert_group.get_command("list").callback(inter_list, status="ACTIVE")
+    list_embed = inter_list.followup.send.call_args.kwargs["embed"]
+    for f in list_embed.fields:
+        assert len(f.name) <= 256
+        assert len(f.value) <= 1024
+
+    fake_channel = MagicMock()
+    fake_channel.send = AsyncMock()
+    with patch.object(bot, "is_closed", return_value=False), \
+         patch.object(bot, "is_ready", return_value=True), \
+         patch.object(bot, "get_channel", return_value=fake_channel):
+        delivered = await bot.dispatch_alert_notification(legacy_record, 73000.0)
+        assert delivered is True
+        sent_embed = fake_channel.send.call_args.kwargs["embed"]
+        assert len(sent_embed.title) <= 256
+        assert len(sent_embed.description) <= 4096
+        for f in sent_embed.fields:
+            assert len(f.name) <= 256
+            assert len(f.value) <= 1024
+
+    await bot.close()

@@ -23,6 +23,23 @@ logger = logging.getLogger(__name__)
 
 MAX_WATCHLIST_ITEMS = 25
 WATCHLIST_FETCH_CONCURRENCY = 8
+MAX_ALERT_NOTE_LENGTH = 150
+MAX_SYMBOL_INPUT_LENGTH = 64
+MAX_DISCORD_CONTENT_LENGTH = 2000
+MAX_EMBED_TITLE_LENGTH = 256
+MAX_EMBED_DESCRIPTION_LENGTH = 4096
+MAX_EMBED_FIELD_NAME_LENGTH = 256
+MAX_EMBED_FIELD_VALUE_LENGTH = 1024
+
+
+def _truncate_text(text: str, max_length: int) -> str:
+    """Safely truncate text to fit Discord API length budgets."""
+    s = str(text)
+    if len(s) <= max_length:
+        return s
+    if max_length <= 3:
+        return s[:max_length]
+    return s[: max_length - 3].rstrip() + "..."
 
 
 def _sanitize_mentions(text: str) -> str:
@@ -647,25 +664,29 @@ class DiscordAlertBot(commands.Bot):
         @app_commands.autocomplete(symbol=symbol_autocomplete_handler)
         async def set_alert(
             interaction: discord.Interaction,
-            symbol: str,
-            target_price: str,
-            note: Optional[str] = None,
+            symbol: app_commands.Range[str, 1, 64],
+            target_price: app_commands.Range[str, 1, 64],
+            note: Optional[app_commands.Range[str, 1, 150]] = None,
             dm: Optional[bool] = False,
         ):
             await safe_defer(interaction, ephemeral=False)
+            bounded_symbol = str(symbol).strip()[:MAX_SYMBOL_INPUT_LENGTH]
+            bounded_target = str(target_price).strip()[:MAX_SYMBOL_INPUT_LENGTH]
+            bounded_note = note.strip()[:MAX_ALERT_NOTE_LENGTH] if isinstance(note, str) and note.strip() else None
+
             success, msg, record = await self.engine.create_user_alert(
                 user_id=str(interaction.user.id),
                 user_name=interaction.user.name,
                 channel_id=str(interaction.channel_id),
                 guild_id=str(interaction.guild_id) if interaction.guild else None,
-                raw_symbol=symbol,
-                target_price=target_price,
-                note=note,
+                raw_symbol=bounded_symbol,
+                target_price=bounded_target,
+                note=bounded_note,
                 notify_dm=bool(dm),
             )
 
             if not success or not record:
-                safe_msg = _sanitize_mentions(msg)
+                safe_msg = _truncate_text(_sanitize_mentions(msg), MAX_DISCORD_CONTENT_LENGTH - 4)
                 await safe_followup_send(
                     interaction,
                     content=f"❌ {safe_msg}",
@@ -682,19 +703,23 @@ class DiscordAlertBot(commands.Bot):
                 target_field_val = f"`{format_price(record.target_price)}`"
 
             embed = discord.Embed(
-                title=f"🎯 Alarm Kuruldu: {record.symbol}",
+                title=_truncate_text(f"🎯 Alarm Kuruldu: {record.symbol}", MAX_EMBED_TITLE_LENGTH),
                 color=0x00FF88 if record.direction == "ABOVE" else 0xFF3366,
                 timestamp=datetime.fromisoformat(record.created_at),
             )
             embed.add_field(name="💵 Güncel Fiyat", value=f"`{format_price(record.initial_price)}`", inline=True)
             embed.add_field(
                 name="🎯 Hedef Fiyat",
-                value=target_field_val,
+                value=_truncate_text(target_field_val, MAX_EMBED_FIELD_VALUE_LENGTH),
                 inline=True,
             )
             embed.add_field(name="📊 Beklenen Yön", value=f"`{direction_tr}`", inline=False)
             if record.note:
-                embed.add_field(name="📝 Not", value=f"> {record.note}", inline=False)
+                embed.add_field(
+                    name="📝 Not",
+                    value=_truncate_text(f"> {record.note}", MAX_EMBED_FIELD_VALUE_LENGTH),
+                    inline=False,
+                )
             embed.set_footer(text=f"Alarm ID: #{record.id} • {record.asset_type}{dm_badge}")
 
             await safe_followup_send(
@@ -741,8 +766,11 @@ class DiscordAlertBot(commands.Bot):
                     price_line = f"Başlangıç: `{format_price(a.initial_price)}`"
 
                 embed.add_field(
-                    name=f"{status_icon} ID `#{a.id}`: {a.symbol} {arrow} `{format_price(a.target_price)}`{dm_str}",
-                    value=f"Durum: `{a.status}` | {price_line}{note_str}",
+                    name=_truncate_text(
+                        f"{status_icon} ID `#{a.id}`: {a.symbol} {arrow} `{format_price(a.target_price)}`{dm_str}",
+                        MAX_EMBED_FIELD_NAME_LENGTH,
+                    ),
+                    value=_truncate_text(f"Durum: `{a.status}` | {price_line}{note_str}", MAX_EMBED_FIELD_VALUE_LENGTH),
                     inline=False,
                 )
 
@@ -784,25 +812,27 @@ class DiscordAlertBot(commands.Bot):
         @self.tree.command(name="price", description="Herhangi bir sembolün güncel fiyatını sorgular")
         @app_commands.describe(symbol="Sorgulanacak sembol (Örn: BTC, ETH, THYAO, GOLD, NASDAQ, DJI, USDTRY)")
         @app_commands.autocomplete(symbol=symbol_autocomplete_handler)
-        async def price_query(interaction: discord.Interaction, symbol: str):
+        async def price_query(interaction: discord.Interaction, symbol: app_commands.Range[str, 1, 64]):
             await safe_defer(interaction, ephemeral=False)
-            norm_symbol, _ = classify_and_normalize(symbol)
-            current_price = await self.engine.feed.get_current_price(symbol)
+            bounded_symbol = str(symbol).strip()[:MAX_SYMBOL_INPUT_LENGTH]
+            norm_symbol, _ = classify_and_normalize(bounded_symbol)
+            current_price = await self.engine.feed.get_current_price(bounded_symbol)
             if current_price is None:
-                safe_sym = _sanitize_mentions(symbol)
+                safe_sym = _sanitize_mentions(bounded_symbol)
+                content = _truncate_text(f"❌ **{safe_sym}** için anlık fiyat alınamadı.", MAX_DISCORD_CONTENT_LENGTH)
                 await safe_followup_send(
                     interaction,
-                    content=f"❌ **{safe_sym}** için anlık fiyat alınamadı.",
+                    content=content,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
 
-            display_title = symbol.upper().strip()
+            display_title = bounded_symbol.upper().strip()
             if display_title != norm_symbol:
                 display_title = f"{display_title} ({norm_symbol})"
 
             embed = discord.Embed(
-                title=f"💰 Fiyat Bilgisi: {display_title}",
+                title=_truncate_text(f"💰 Fiyat Bilgisi: {display_title}", MAX_EMBED_TITLE_LENGTH),
                 color=0x3399FF,
                 timestamp=datetime.now(),
             )
@@ -982,8 +1012,8 @@ class DiscordAlertBot(commands.Bot):
             pct_suffix = ""
 
         embed = discord.Embed(
-            title=f"{icon} FİYAT ALARMI TETİKLENDİ: {alert.symbol}",
-            description=f"> **{alert.symbol}** hedef fiyata ulaştı!{pct_suffix}",
+            title=_truncate_text(f"{icon} FİYAT ALARMI TETİKLENDİ: {alert.symbol}", MAX_EMBED_TITLE_LENGTH),
+            description=_truncate_text(f"> **{alert.symbol}** hedef fiyata ulaştı!{pct_suffix}", MAX_EMBED_DESCRIPTION_LENGTH),
             color=color,
             timestamp=datetime.now(),
         )
@@ -993,7 +1023,11 @@ class DiscordAlertBot(commands.Bot):
         embed.add_field(name="📊 Hareket Yönü", value=f"`{direction_label}`", inline=False)
 
         if alert.note:
-            embed.add_field(name="📝 Hatırlatıcı Not", value=f"> {alert.note}", inline=False)
+            embed.add_field(
+                name="📝 Hatırlatıcı Not",
+                value=_truncate_text(f"> {alert.note}", MAX_EMBED_FIELD_VALUE_LENGTH),
+                inline=False,
+            )
 
         embed.set_footer(text=f"Alarm ID: #{alert.id} • Coolify Alert Engine")
         view = AlertActionView(self.engine, alert)
