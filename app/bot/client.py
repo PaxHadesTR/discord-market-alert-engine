@@ -1107,14 +1107,6 @@ class DiscordAlertBot(commands.Bot):
 
         # 2. Standard Channel dispatch
         target_channel_id = self.settings.DISCORD_ALERT_CHANNEL_ID or int(alert.channel_id)
-        channel = self.get_channel(target_channel_id)
-
-        if not channel:
-            try:
-                channel = await self.fetch_channel(target_channel_id)
-            except Exception as e:
-                logger.error("Could not fetch Discord channel %s to dispatch alert: %s", target_channel_id, e)
-                return False
 
         delivered = False
         owner_mention_policy = discord.AllowedMentions(
@@ -1124,6 +1116,12 @@ class DiscordAlertBot(commands.Bot):
         )
         for attempt in range(1, 4):
             try:
+                channel = self.get_channel(target_channel_id)
+                if not channel:
+                    channel = await self.fetch_channel(target_channel_id)
+                if not channel:
+                    logger.error("Could not find Discord channel %s to dispatch alert.", target_channel_id)
+                    break
                 await channel.send(content=content, embed=embed, view=view, allowed_mentions=owner_mention_policy)
                 logger.info("Successfully announced alert #%d in Discord channel %s", alert.id, target_channel_id)
                 delivered = True

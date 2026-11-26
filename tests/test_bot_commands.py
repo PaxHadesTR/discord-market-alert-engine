@@ -887,3 +887,59 @@ async def test_watchlist_add_concurrent_requests_never_exceed_quota(tmp_path):
     assert rejected_replies == 4
 
     await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_alert_notification_retries_transient_fetch_channel_errors():
+    """RES-BOT-001: Transient aiohttp/Timeout errors during fetch_channel retry and recover; exhaustion returns False."""
+    import asyncio
+    import aiohttp
+
+    mock_engine = MagicMock()
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token", DISCORD_ALERT_CHANNEL_ID=555))
+    alert = AlertRecord(
+        id=301,
+        user_id="111",
+        user_name="Trader",
+        channel_id="555",
+        guild_id=None,
+        symbol="BTCUSDT",
+        asset_type="CRYPTO",
+        target_price=70000.0,
+        initial_price=65000.0,
+        direction="ABOVE",
+        status="TRIGGERED",
+        created_at="2026-10-29T20:00:00+00:00",
+    )
+
+    ch = MagicMock()
+    ch.send = AsyncMock()
+    fetch_calls = 0
+
+    async def flaky_fetch(cid):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        if fetch_calls == 1:
+            raise aiohttp.ClientError("proxy 503")
+        if fetch_calls == 2:
+            raise asyncio.TimeoutError("gateway timeout")
+        return ch
+
+    with patch.object(bot, "is_closed", return_value=False), \
+         patch.object(bot, "is_ready", return_value=True), \
+         patch.object(bot, "get_channel", return_value=None), \
+         patch.object(bot, "fetch_channel", side_effect=flaky_fetch), \
+         patch("app.bot.client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        assert await bot.dispatch_alert_notification(alert, 71000.0) is True
+        assert fetch_calls == 3
+        ch.send.assert_awaited_once()
+        assert mock_sleep.await_count == 2
+
+        # Exhausted transient fetch_channel errors return False cleanly with 2 sleeps
+        mock_sleep.reset_mock()
+        with patch.object(bot, "fetch_channel", new_callable=AsyncMock, side_effect=aiohttp.ClientError("down")) as fail_fetch:
+            assert await bot.dispatch_alert_notification(alert, 71000.0) is False
+            assert fail_fetch.await_count == 3
+            assert mock_sleep.await_count == 2
+
+    await bot.close()
