@@ -1013,3 +1013,129 @@ def test_alert_delete_dropdown_enforces_100_char_select_option_limits():
     assert dropdown.options[0].description.endswith("...")
     assert dropdown.options[1].label == "ID #12 • BTCUSDT ($72,000.00)"
     assert dropdown.options[1].description == "ABOVE | Başlangıç: $68,000.00"
+
+
+@pytest.mark.asyncio
+async def test_bot_autocomplete_retry_helpers_dropdowns_and_watchlist_remove():
+    """V6-BOT-COV-001: Dual-path coverage for autocomplete, safe_defer/safe_followup_send, AlertDeleteDropdown, HelpCategorySelect, and watchlist_remove."""
+    import asyncio
+    import aiohttp
+    from app.bot.client import (
+        AlertDeleteDropdown,
+        HelpCategorySelect,
+        safe_defer,
+        safe_followup_send,
+        symbol_autocomplete_handler,
+    )
+
+    # 1. symbol_autocomplete_handler extracts yahoo_feed + price_cache and clamps 25 items / 100 chars
+    inter_ac = _make_mock_interaction(user_id=111)
+    fake_yahoo = MagicMock()
+    inter_ac.client = MagicMock()
+    inter_ac.client.engine.feed.yahoo = fake_yahoo
+    inter_ac.client.engine.feed.price_cache = {"BTCUSDT": (70000.0, 1.0), "ETHUSDT": (3500.0, 1.0)}
+    long_suggestions = [(f"LABEL_{i}_" + ("A" * 120), f"VAL_{i}_" + ("B" * 120)) for i in range(30)]
+
+    with patch("app.bot.client.get_symbol_autocomplete_async", new_callable=AsyncMock, return_value=long_suggestions) as mock_ac:
+        choices = await symbol_autocomplete_handler(inter_ac, "bt")
+        mock_ac.assert_awaited_once_with("bt", yahoo_feed=fake_yahoo, live_crypto_symbols=["BTCUSDT", "ETHUSDT"])
+        assert len(choices) == 25
+        assert all(len(c.name) <= 100 and len(c.value) <= 100 for c in choices)
+
+    # Works safely when client has no engine
+    inter_ac_empty = _make_mock_interaction(user_id=111)
+    inter_ac_empty.client = None
+    with patch("app.bot.client.get_symbol_autocomplete_async", new_callable=AsyncMock, return_value=[("BTC", "BTCUSDT")]) as mock_ac2:
+        choices_empty = await symbol_autocomplete_handler(inter_ac_empty, "btc")
+        mock_ac2.assert_awaited_once_with("btc", yahoo_feed=None, live_crypto_symbols=None)
+        assert len(choices_empty) == 1
+
+    # 2. safe_defer & safe_followup_send retry transient errors, fail fast on non-transient, and raise on exhaustion
+    with patch("app.bot.client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        inter_defer = _make_mock_interaction(user_id=111)
+        inter_defer.response.defer = AsyncMock(side_effect=[aiohttp.ClientError("503"), None])
+        assert await safe_defer(inter_defer, ephemeral=True, max_retries=3, retry_delay=0.01) is True
+        assert inter_defer.response.defer.await_count == 2
+        assert mock_sleep.await_count == 1
+
+        inter_defer_fail = _make_mock_interaction(user_id=111)
+        inter_defer_fail.response.defer = AsyncMock(side_effect=asyncio.TimeoutError("timeout"))
+        with pytest.raises(asyncio.TimeoutError):
+            await safe_defer(inter_defer_fail, max_retries=2, retry_delay=0.01)
+        assert inter_defer_fail.response.defer.await_count == 2
+
+        inter_defer_val = _make_mock_interaction(user_id=111)
+        inter_defer_val.response.defer = AsyncMock(side_effect=ValueError("bad"))
+        with pytest.raises(ValueError):
+            await safe_defer(inter_defer_val, max_retries=3, retry_delay=0.01)
+        assert inter_defer_val.response.defer.await_count == 1
+
+        inter_fu = _make_mock_interaction(user_id=111)
+        inter_fu.followup.send = AsyncMock(side_effect=[aiohttp.ClientError("503"), "ok_msg"])
+        res_fu = await safe_followup_send(inter_fu, max_retries=3, retry_delay=0.01, content="hello")
+        assert res_fu == "ok_msg"
+        assert inter_fu.followup.send.await_count == 2
+
+        inter_fu_fail = _make_mock_interaction(user_id=111)
+        inter_fu_fail.followup.send = AsyncMock(side_effect=aiohttp.ClientError("down"))
+        with pytest.raises(aiohttp.ClientError):
+            await safe_followup_send(inter_fu_fail, max_retries=2, retry_delay=0.01, content="hello")
+        assert inter_fu_fail.followup.send.await_count == 2
+
+    # 3. AlertDeleteDropdown callback: non-owner blocked, owner delete succeeds, missing alert reports failure
+    alert = AlertRecord(
+        id=42, user_id="111", user_name="Owner", channel_id="222", guild_id=None,
+        symbol="BTCUSDT", asset_type="CRYPTO", target_price=72000.0, initial_price=68000.0,
+        direction="ABOVE", status="ACTIVE", created_at="2026-10-29T20:00:00+00:00",
+    )
+    mock_engine = MagicMock()
+    mock_engine.db = MagicMock()
+    mock_engine.db.cancel_alert = AsyncMock(return_value=True)
+    dropdown = AlertDeleteDropdown(mock_engine, [alert], "111")
+    dropdown._values = ["42"]
+
+    inter_intruder = _make_mock_interaction(user_id=999)
+    await dropdown.callback(inter_intruder)
+    mock_engine.db.cancel_alert.assert_not_awaited()
+    assert inter_intruder.response.send_message.call_args.kwargs["ephemeral"] is True
+
+    inter_owner = _make_mock_interaction(user_id=111)
+    await dropdown.callback(inter_owner)
+    mock_engine.db.cancel_alert.assert_awaited_once_with(alert_id=42, user_id="111")
+    assert dropdown.disabled is True
+    inter_owner.response.edit_message.assert_awaited_once()
+    assert "#42" in inter_owner.followup.send.call_args.kwargs["content"]
+
+    mock_engine.db.cancel_alert = AsyncMock(return_value=False)
+    inter_missing = _make_mock_interaction(user_id=111)
+    await dropdown.callback(inter_missing)
+    assert "hata" in inter_missing.response.send_message.call_args.args[0]
+
+    # 4. HelpCategorySelect switches cleanly across all 5 categories
+    help_select = HelpCategorySelect()
+    seen_titles = set()
+    for cat in ("overview", "alerts", "market", "symbols", "tradingview"):
+        help_select._values = [cat]
+        inter_help = _make_mock_interaction(user_id=111)
+        await help_select.callback(inter_help)
+        embed = inter_help.response.edit_message.call_args.kwargs["embed"]
+        assert embed.title and embed.footer.text
+        seen_titles.add(embed.title)
+    assert len(seen_titles) == 5
+
+    # 5. /watchlist remove happy and not-found paths
+    mock_engine.db.remove_from_watchlist = AsyncMock(side_effect=[True, False])
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    bot._register_commands()
+    rm_cmd = bot.tree.get_command("watchlist").get_command("remove")
+
+    inter_rm_ok = _make_mock_interaction(user_id=111)
+    await rm_cmd.callback(inter_rm_ok, symbol="btc")
+    mock_engine.db.remove_from_watchlist.assert_any_await("111", "BTCUSDT")
+    assert "çıkarıldı" in inter_rm_ok.followup.send.call_args.kwargs["content"]
+
+    inter_rm_miss = _make_mock_interaction(user_id=111)
+    await rm_cmd.callback(inter_rm_miss, symbol="ETH")
+    assert "bulunamadı" in inter_rm_miss.followup.send.call_args.kwargs["content"]
+
+    await bot.close()
