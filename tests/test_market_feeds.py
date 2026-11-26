@@ -392,3 +392,37 @@ async def test_unified_feed_rejects_non_positive_and_non_finite_prices():
     await feed._handle_price_tick("BTCUSDT", 70100.5)
     assert feed.price_cache["BTCUSDT"][0] == 70100.5
     assert received == [("BTCUSDT", 70100.5)]
+
+
+@pytest.mark.asyncio
+async def test_unified_feed_price_cache_enforces_lru_capacity_and_ttl_eviction():
+    """MEM-FEED-001: UnifiedPriceFeed.price_cache stays bounded by max_cache_size and prunes expired entries."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    binance = MagicMock()
+    binance.fetch_price = AsyncMock(return_value=10.0)
+    yahoo = MagicMock()
+    feed = UnifiedPriceFeed(
+        binance_feed=binance,
+        yahoo_feed=yahoo,
+        cache_ttl_seconds=20.0,
+        max_cache_size=3,
+    )
+
+    # Insert 5 distinct symbols -> LRU evicts oldest entries to stay <= 3
+    for i in range(5):
+        await feed._handle_price_tick(f"COIN{i}USDT", 100.0 + i)
+
+    assert len(feed.price_cache) == 3
+    assert list(feed.price_cache.keys()) == ["COIN2USDT", "COIN3USDT", "COIN4USDT"]
+
+    # Touch COIN2USDT via get_current_price -> promotes it to MRU so COIN3USDT is evicted next
+    assert await feed.get_current_price("COIN2USDT") == 102.0
+    await feed._handle_price_tick("COIN5USDT", 105.0)
+    assert list(feed.price_cache.keys()) == ["COIN4USDT", "COIN2USDT", "COIN5USDT"]
+
+    # Expired oldest entry is pruned on subsequent write even below capacity
+    feed.price_cache["COIN4USDT"] = (104.0, time.time() - 120.0)
+    await feed._handle_price_tick("COIN5USDT", 106.0)
+    assert "COIN4USDT" not in feed.price_cache
+    assert "COIN5USDT" in feed.price_cache

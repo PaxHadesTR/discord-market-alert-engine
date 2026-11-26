@@ -1,8 +1,9 @@
 import asyncio
+from collections import OrderedDict
 import logging
 import math
 import time
-from typing import Callable, Coroutine, Dict, List, Optional, Tuple
+from typing import Callable, Coroutine, List, Optional, Tuple
 from app.market_data.binance import BinanceMarketFeed
 from app.market_data.symbols import classify_and_normalize
 from app.market_data.yahoo import YahooFinanceFeed
@@ -30,14 +31,32 @@ class UnifiedPriceFeed:
         binance_feed: Optional[BinanceMarketFeed] = None,
         yahoo_feed: Optional[YahooFinanceFeed] = None,
         cache_ttl_seconds: float = 20.0,
+        max_cache_size: int = 5000,
     ) -> None:
         self.binance = binance_feed or BinanceMarketFeed()
         self.yahoo = yahoo_feed or YahooFinanceFeed()
         self.cache_ttl = cache_ttl_seconds
-        # Maps symbol -> (price: float, timestamp: float)
-        self.price_cache: Dict[str, Tuple[float, float]] = {}
+        self.max_cache_size = max(1, int(max_cache_size))
+        # Bounded LRU cache: maps symbol -> (price: float, timestamp: float)
+        self.price_cache: OrderedDict[str, Tuple[float, float]] = OrderedDict()
         self._listeners: List[PriceListener] = []
         self._active_non_crypto_supplier: Optional[Callable[[], Coroutine[None, None, List[str]]]] = None
+
+    def _set_cached_price(self, symbol: str, price: float, now: float) -> None:
+        """Store a validated price in the bounded LRU cache and prune expired oldest entries."""
+        self.price_cache[symbol] = (price, now)
+        self.price_cache.move_to_end(symbol)
+
+        cutoff = now - self.cache_ttl
+        while len(self.price_cache) > 1:
+            oldest_key, (_, oldest_ts) = next(iter(self.price_cache.items()))
+            if oldest_key != symbol and oldest_ts < cutoff:
+                self.price_cache.popitem(last=False)
+            else:
+                break
+
+        while len(self.price_cache) > self.max_cache_size:
+            self.price_cache.popitem(last=False)
 
     def set_active_equity_supplier(self, supplier: Callable[[], Coroutine[None, None, List[str]]]) -> None:
         """Provide callback to supply active non-crypto symbols for Yahoo polling."""
@@ -58,6 +77,7 @@ class UnifiedPriceFeed:
         if normalized in self.price_cache:
             cached_price, cached_at = self.price_cache[normalized]
             if (now - cached_at) <= self.cache_ttl and _is_valid_price(cached_price):
+                self.price_cache.move_to_end(normalized)
                 return float(cached_price)
 
         if asset_type == "CRYPTO":
@@ -69,7 +89,7 @@ class UnifiedPriceFeed:
             return None
 
         valid_price = float(price)
-        self.price_cache[normalized] = (valid_price, now)
+        self._set_cached_price(normalized, valid_price, now)
         return valid_price
 
     async def _handle_price_tick(self, symbol: str, price: float) -> None:
@@ -80,7 +100,7 @@ class UnifiedPriceFeed:
 
         valid_price = float(price)
         symbol_upper = symbol.upper()
-        self.price_cache[symbol_upper] = (valid_price, time.time())
+        self._set_cached_price(symbol_upper, valid_price, time.time())
 
         # Notify listeners concurrently
         if self._listeners:
