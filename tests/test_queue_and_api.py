@@ -387,3 +387,34 @@ async def test_queue_stop_drains_buffered_alerts_and_respects_drain_timeout():
     assert hung_closed is True
     assert hung_queue._worker_task is None
     assert hung_queue.queue._unfinished_tasks == 0
+
+
+@pytest.mark.asyncio
+async def test_lifespan_startup_failure_cleans_up_queue_worker_and_http_client(monkeypatch, tmp_path):
+    """F-10255b4da261: Failure in alert_engine.start() stops queue worker and closes DiscordWebhookProvider HTTP client."""
+    from unittest.mock import AsyncMock, patch
+    from fastapi import FastAPI
+    from app.config import get_settings
+    from app.main import lifespan
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "fail_startup.db"))
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/12345/abcdef")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "")
+    get_settings.cache_clear()
+
+    test_app = FastAPI()
+    try:
+        with patch("app.main.AutonomousAlertEngine.start", new_callable=AsyncMock, side_effect=OSError("disk full")), \
+             patch("app.main.AutonomousAlertEngine.stop", new_callable=AsyncMock) as mock_engine_stop:
+            with pytest.raises(OSError, match="disk full"):
+                async with lifespan(test_app):
+                    pass
+
+            mock_engine_stop.assert_awaited_once()
+            qs = test_app.state.queue_service
+            assert qs._worker_task is None
+            assert qs._running is False
+            assert len(qs.providers) == 1
+            assert qs.providers[0]._client.is_closed is True
+    finally:
+        get_settings.cache_clear()
