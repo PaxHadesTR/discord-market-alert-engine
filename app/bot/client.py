@@ -573,6 +573,8 @@ class DiscordAlertBot(commands.Bot):
         self.settings = settings
         self.active_proxy = proxy_url
         self.start_time = time.time()
+        self._watchlist_lock: Optional[asyncio.Lock] = None
+        self._watchlist_lock_loop: Optional[asyncio.AbstractEventLoop] = None
         self.engine.trigger_callback = self.dispatch_alert_notification
         logging.getLogger("discord.gateway").setLevel(logging.INFO)
         logging.getLogger("discord.client").setLevel(logging.INFO)
@@ -580,6 +582,14 @@ class DiscordAlertBot(commands.Bot):
             logger.info("Discord Bot configured with outbound proxy: %s", proxy_url)
         elif proxy_override is None and getattr(settings, "discord_proxy_list", []):
             logger.info("Discord Bot attempting direct connection (proxy fallback mode).")
+
+    def _get_watchlist_lock(self) -> asyncio.Lock:
+        """Return an asyncio.Lock bound to the active event loop for atomic watchlist quota enforcement."""
+        loop = asyncio.get_running_loop()
+        if self._watchlist_lock is None or self._watchlist_lock_loop is not loop:
+            self._watchlist_lock = asyncio.Lock()
+            self._watchlist_lock_loop = loop
+        return self._watchlist_lock
 
     async def setup_hook(self) -> None:
         """Register persistent dynamic items, slash command groups, and sync tree."""
@@ -930,23 +940,36 @@ class DiscordAlertBot(commands.Bot):
                 )
                 return
 
-            existing = await self.engine.db.get_user_watchlist(str(interaction.user.id))
-            if norm_symbol in existing:
+            user_id_str = str(interaction.user.id)
+            async with self._get_watchlist_lock():
+                existing = await self.engine.db.get_user_watchlist(user_id_str)
+                if norm_symbol in existing:
+                    already_exists = True
+                    quota_reached = False
+                    success = False
+                elif len(existing) >= MAX_WATCHLIST_ITEMS:
+                    already_exists = False
+                    quota_reached = True
+                    success = False
+                else:
+                    already_exists = False
+                    quota_reached = False
+                    success = await self.engine.db.add_to_watchlist(user_id_str, norm_symbol, asset_type)
+
+            if already_exists:
                 await safe_followup_send(
                     interaction,
                     content=f"ℹ️ **{norm_symbol}** zaten takip listenizde kayıtlı.",
                     ephemeral=True,
                 )
                 return
-            if len(existing) >= MAX_WATCHLIST_ITEMS:
+            if quota_reached:
                 await safe_followup_send(
                     interaction,
                     content=f"❌ Takip listesi limitine ({MAX_WATCHLIST_ITEMS}) ulaştınız. Yeni sembol eklemek için önce `/watchlist remove` kullanın.",
                     ephemeral=True,
                 )
                 return
-
-            success = await self.engine.db.add_to_watchlist(str(interaction.user.id), norm_symbol, asset_type)
 
             if success:
                 price = await self.engine.feed.get_current_price(norm_symbol)

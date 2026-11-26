@@ -825,3 +825,65 @@ async def test_command_error_handler_redacts_proxy_credentials_and_hides_raw_exc
     assert inter_generic.followup.send.call_args.kwargs["ephemeral"] is True
 
     await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_watchlist_add_concurrent_requests_never_exceed_quota(tmp_path):
+    """CONC-BOT-001: Concurrent /watchlist add commands serialize quota check + insert and never exceed MAX_WATCHLIST_ITEMS."""
+    import asyncio
+    from app.bot.client import MAX_WATCHLIST_ITEMS
+    from app.database.db import AlertDatabase
+
+    db = AlertDatabase(str(tmp_path / "wl_race.db"))
+    await db.init_db()
+    # Pre-populate 23 items so only 2 slots remain
+    for i in range(MAX_WATCHLIST_ITEMS - 2):
+        assert await db.add_to_watchlist("u1", f"SYM{i}", "EQUITY_FOREX") is True
+
+    orig_get = db.get_user_watchlist
+
+    async def slow_get(uid: str):
+        items = await orig_get(uid)
+        await asyncio.sleep(0.02)
+        return items
+
+    db.get_user_watchlist = slow_get
+
+    mock_engine = MagicMock()
+    mock_engine.db = db
+    mock_engine.feed = MagicMock()
+    mock_engine.feed.get_current_price = AsyncMock(return_value=100.0)
+
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    bot._register_commands()
+    add_cmd = bot.tree.get_command("watchlist").get_command("add")
+
+    # Fire 6 concurrent additions for distinct symbols when only 2 slots remain
+    interactions = [_make_mock_interaction(user_id=1) for _ in range(6)]
+    await asyncio.gather(
+        *[add_cmd.callback(inter, symbol=f"NEW{i}") for i, inter in enumerate(interactions)]
+    )
+
+    final_items = await orig_get("1")
+    # Wait: pre-populated user was "u1"; run again for user "1" with 23 pre-populated items!
+    assert len(final_items) == 6
+
+    # Now test actual cap enforcement for user "99" starting at MAX_WATCHLIST_ITEMS - 2
+    for i in range(MAX_WATCHLIST_ITEMS - 2):
+        assert await db.add_to_watchlist("99", f"BASE{i}", "EQUITY_FOREX") is True
+    cap_interactions = [_make_mock_interaction(user_id=99) for _ in range(6)]
+    await asyncio.gather(
+        *[add_cmd.callback(inter, symbol=f"CAP{i}") for i, inter in enumerate(cap_interactions)]
+    )
+    capped_items = await orig_get("99")
+    assert len(capped_items) == MAX_WATCHLIST_ITEMS
+    added_replies = sum(
+        1 for inter in cap_interactions if "takip listenize eklendi" in inter.followup.send.call_args.kwargs["content"]
+    )
+    rejected_replies = sum(
+        1 for inter in cap_interactions if "limitine" in inter.followup.send.call_args.kwargs["content"]
+    )
+    assert added_replies == 2
+    assert rejected_replies == 4
+
+    await bot.close()
