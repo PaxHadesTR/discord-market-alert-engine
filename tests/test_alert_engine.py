@@ -653,3 +653,63 @@ async def test_cancelled_trigger_callback_rolls_back_alert_to_active(setup_engin
     await engine._on_price_tick("BTCUSDT", 71500.0)
     assert delivered == [(rec.id, 71500.0)]
     assert (await engine.db.get_alert_by_id(rec.id)).status == "TRIGGERED"
+
+
+@pytest.mark.asyncio
+async def test_engine_non_crypto_supplier_expiry_worker_and_price_edge_cases(setup_engine):
+    """V6-ENGINE-COV-001: Cover _get_active_non_crypto_symbols, _expiry_worker, and target price edge cases."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+    from app.services.alert_engine import parse_target_price_input
+
+    engine, _, _ = setup_engine
+
+    # 1. _get_active_non_crypto_symbols aggregates EQUITY_FOREX alerts + watchlists, dedupes, and excludes CRYPTO
+    await engine.db.add_alert("u1", "U1", "c1", None, "THYAO.IS", "EQUITY_FOREX", 350.0, 300.0, "ABOVE")
+    await engine.db.add_alert("u1", "U1", "c1", None, "BTCUSDT", "CRYPTO", 70000.0, 65000.0, "ABOVE")
+    await engine.db.add_to_watchlist("u1", "THYAO.IS", "EQUITY_FOREX")
+    await engine.db.add_to_watchlist("u1", "AAPL", "EQUITY_FOREX")
+    await engine.db.add_to_watchlist("u1", "ETHUSDT", "CRYPTO")
+
+    non_crypto = await engine._get_active_non_crypto_symbols()
+    assert set(non_crypto) == {"THYAO.IS", "AAPL"}
+    assert len(non_crypto) == 2
+
+    # 2. _expiry_worker recovers from transient DB error, expires stale alerts, and stops cleanly on cancel
+    calls = 0
+
+    async def fake_sleep(_delay: float):
+        nonlocal calls
+        calls += 1
+        if calls >= 3:
+            raise asyncio.CancelledError
+
+    expire_mock = AsyncMock(side_effect=[RuntimeError("transient db lock"), 1])
+    engine.db.expire_stale_alerts = expire_mock
+    engine._running = True
+    with patch("app.services.alert_engine.asyncio.sleep", side_effect=fake_sleep):
+        await engine._expiry_worker()
+    assert expire_mock.await_count == 2
+    engine._running = False
+
+    # 3. parse_target_price_input edge cases: '0%', '-100%', '70k', '1.5m', '$65,000', '1,250.50', '68.500,25'
+    val_zero_pct, err_zero_pct = parse_target_price_input("0%", 65000.0)
+    assert val_zero_pct is None and err_zero_pct is not None
+
+    val_neg100, err_neg100 = parse_target_price_input("-100%", 65000.0)
+    assert val_neg100 is None and err_neg100 is not None
+
+    assert parse_target_price_input("70k", 65000.0) == (70000.0, None)
+    assert parse_target_price_input("1.5m", 65000.0) == (1500000.0, None)
+    assert parse_target_price_input("$65,000", 65000.0) == (65000.0, None)
+    assert parse_target_price_input("1,250.50", 1000.0) == (1250.50, None)
+    assert parse_target_price_input("68.500,25", 65000.0) == (68500.25, None)
+
+    # 4. create_user_alert rejects target_price == current_price
+    ok_eq, msg_eq, rec_eq = await engine.create_user_alert(
+        user_id="u_eq", user_name="Trader", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price="65000",
+    )
+    assert ok_eq is False
+    assert rec_eq is None
+    assert "eşit" in msg_eq
