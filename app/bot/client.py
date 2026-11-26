@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 from app.config import Settings
 from app.database.db import AlertRecord
+from app.routes.health import _redact_sensitive_text
 from app.market_data.symbols import (
     classify_and_normalize,
     get_symbol_autocomplete,
@@ -600,32 +601,35 @@ class DiscordAlertBot(commands.Bot):
         """Global error handler for slash commands."""
         @self.tree.error
         async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+            safe_error = _redact_sensitive_text(error, max_length=1000)
             logger.error(
                 "Error executing command %s: %s",
                 interaction.command.name if interaction.command else "unknown",
-                error,
-                exc_info=True,
+                safe_error,
+                exc_info=(safe_error == " ".join(str(error).splitlines()).strip()),
             )
             err_str = str(error)
             is_proxy_err = "503" in err_str or "ClientHttpProxyError" in err_str or "Proxy" in err_str or "Cannot connect to host" in err_str
 
             if is_proxy_err:
-                proxy_label = self.active_proxy or "proxy"
+                proxy_label = _redact_sensitive_text(self.active_proxy) if self.active_proxy else "proxy"
                 msg = (
                     "⚠️ **Geçici Proxy Bağlantı Hatası (503):**\n"
                     f"> Discord proxy bağlantısında (`{proxy_label}`) anlık bir rota yenilenmesi veya kesinti yaşandı.\n"
                     "> Lütfen **5-10 saniye bekleyip komutu tekrar deneyin**. Sorun devam ederse sunucudaki `spoof-dpi` / `warp` konteynerlerini kontrol edin."
                 )
             else:
-                msg = f"⚠️ Komut işlenirken bir hata oluştu: {error}"
+                msg = "⚠️ Komut işlenirken beklenmeyen bir hata oluştu. Lütfen tekrar deneyin."
+
+            msg = _truncate_text(_sanitize_mentions(msg), MAX_DISCORD_CONTENT_LENGTH)
 
             try:
                 if interaction.response.is_done():
-                    await interaction.followup.send(msg, ephemeral=True)
+                    await interaction.followup.send(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
                 else:
-                    await interaction.response.send_message(msg, ephemeral=True)
+                    await interaction.response.send_message(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
             except Exception as send_err:
-                logger.debug("Could not deliver error message to Discord user: %s", send_err)
+                logger.debug("Could not deliver error message to Discord user: %s", _redact_sensitive_text(send_err))
 
     async def on_connect(self) -> None:
         """Invoked when bot establishes connection with Discord Gateway."""

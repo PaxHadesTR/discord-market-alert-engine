@@ -782,3 +782,46 @@ async def test_dispatch_alert_notification_dm_retry_fallback_and_channel_failure
             assert mock_sleep.await_count == 2
 
     await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_command_error_handler_redacts_proxy_credentials_and_hides_raw_exceptions():
+    """SEC-SECRETS-001: on_app_command_error redacts proxy userinfo, hides raw exception text, and bounds reply length."""
+    from discord import app_commands
+
+    u, p = "proxyacct", "proxypwd99"
+    proxy_url = f"http://{u}:{p}@proxy.internal:8080"
+
+    bot = DiscordAlertBot(
+        engine=MagicMock(),
+        settings=Settings(DISCORD_BOT_TOKEN="mock_token"),
+        proxy_override=proxy_url,
+    )
+    bot._setup_error_handler()
+
+    # 1. Proxy 503 error masks credentials in ephemeral response
+    inter_proxy = _make_mock_interaction(user_id=111)
+    inter_proxy.command = MagicMock(name="price")
+    inter_proxy.command.name = "price"
+    await bot.tree.on_error(inter_proxy, app_commands.AppCommandError(f"503 ClientHttpProxyError via {proxy_url}"))
+
+    proxy_msg = inter_proxy.response.send_message.call_args.args[0]
+    assert u not in proxy_msg and p not in proxy_msg
+    assert "http://***@proxy.internal:8080" in proxy_msg
+    assert len(proxy_msg) <= 2000
+    assert inter_proxy.response.send_message.call_args.kwargs["ephemeral"] is True
+
+    # 2. Non-proxy error never reflects raw exception internals or oversized strings
+    inter_generic = _make_mock_interaction(user_id=111)
+    inter_generic.command = MagicMock()
+    inter_generic.command.name = "alert"
+    inter_generic.response.is_done.return_value = True
+    secret_detail = "INTERNAL_DB_SECRET_" + ("X" * 3000)
+    await bot.tree.on_error(inter_generic, app_commands.AppCommandError(secret_detail))
+
+    generic_msg = inter_generic.followup.send.call_args.args[0]
+    assert "INTERNAL_DB_SECRET_" not in generic_msg
+    assert len(generic_msg) <= 2000
+    assert inter_generic.followup.send.call_args.kwargs["ephemeral"] is True
+
+    await bot.close()
