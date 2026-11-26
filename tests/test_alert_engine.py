@@ -560,3 +560,46 @@ async def test_refresh_active_symbols_does_not_overwrite_concurrent_mutations(se
     )
     assert results[1][0] is True
     assert "BTCUSDT" in engine._active_symbols
+
+
+@pytest.mark.asyncio
+async def test_parse_target_price_input_handles_us_and_eu_thousands_grouping(setup_engine):
+    """F-a83a3f4e801b: US/EU thousands separators parse accurately without 1000x corruption; malformed groupings rejected."""
+    from app.services.alert_engine import parse_target_price_input
+
+    engine, _, _ = setup_engine
+
+    # Happy paths: US thousands, mixed US/EU separators, Turkish decimal comma, and suffixes
+    cases = [
+        ("$65,000", 65000.0),
+        ("68,450", 68450.0),
+        ("1,234,567", 1234567.0),
+        ("68,500.25", 68500.25),
+        ("1,250.50", 1250.50),
+        ("68.500,25", 68500.25),
+        ("1.234.567,89", 1234567.89),
+        ("1.234.567", 1234567.0),
+        ("66000,50", 66000.50),
+        ("0,525", 0.525),
+        ("70k", 70000.0),
+        ("1,5m", 1500000.0),
+    ]
+    for raw, expected in cases:
+        val, err = parse_target_price_input(raw, 65000.0)
+        assert err is None, f"Unexpected error for {raw!r}: {err}"
+        assert val == pytest.approx(expected)
+
+    # End-to-end: '$68,000' above current 65000 creates ABOVE alert (not BELOW $68.00)
+    ok, _, rec = await engine.create_user_alert(
+        user_id="u_us", user_name="Trader", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price="$68,000",
+    )
+    assert ok is True and rec is not None
+    assert rec.target_price == 68000.0
+    assert rec.direction == "ABOVE"
+
+    # Adversarial: malformed separator groupings and non-numeric strings are rejected
+    for bad in ("12,34,56", "12.34.56", "1,23.45", "1.23,45", "65,,000", "abc", "12.34.56.78"):
+        val, err = parse_target_price_input(bad, 65000.0)
+        assert val is None, f"Expected rejection for {bad!r}, got {val!r}"
+        assert err is not None
