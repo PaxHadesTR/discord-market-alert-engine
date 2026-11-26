@@ -208,9 +208,9 @@ class AlertDeleteDropdown(discord.ui.Select):
         for a in alerts[:25]:  # Discord select menu max is 25 items
             options.append(
                 discord.SelectOption(
-                    label=f"ID #{a.id} • {a.symbol} ({format_price(a.target_price)})",
-                    value=str(a.id),
-                    description=f"{a.direction} | Başlangıç: {format_price(a.initial_price)}",
+                    label=_truncate_text(f"ID #{a.id} • {a.symbol} ({format_price(a.target_price)})", 100),
+                    value=str(a.id)[:100],
+                    description=_truncate_text(f"{a.direction} | Başlangıç: {format_price(a.initial_price)}", 100),
                     emoji="🗑",
                 )
             )

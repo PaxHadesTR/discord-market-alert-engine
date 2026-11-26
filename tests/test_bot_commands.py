@@ -970,3 +970,46 @@ async def test_stats_command_guards_nonfinite_and_negative_bot_latency():
     assert inter_ok.followup.send.call_args.kwargs["embed"].fields[0].value == "`42.6 ms`"
 
     await bot.close()
+
+
+def test_alert_delete_dropdown_enforces_100_char_select_option_limits():
+    """LOGIC-BOT-SELECT-LEN-001: AlertDeleteDropdown truncates oversized symbol/direction labels and descriptions <= 100 chars."""
+    from app.bot.client import AlertDeleteDropdown
+
+    oversized_alert = AlertRecord(
+        id=999999999,
+        user_id="111",
+        user_name="Trader",
+        channel_id="222",
+        guild_id=None,
+        symbol="LONG_LEGACY_SYMBOL_" + ("X" * 120),
+        asset_type="CRYPTO",
+        target_price=0.000000001234,
+        initial_price=0.000000001111,
+        direction="ABOVE_" + ("D" * 120),
+        status="ACTIVE",
+        created_at="2026-10-29T20:00:00+00:00",
+    )
+    normal_alert = AlertRecord(
+        id=12,
+        user_id="111",
+        user_name="Trader",
+        channel_id="222",
+        guild_id=None,
+        symbol="BTCUSDT",
+        asset_type="CRYPTO",
+        target_price=72000.0,
+        initial_price=68000.0,
+        direction="ABOVE",
+        status="ACTIVE",
+        created_at="2026-10-29T20:00:00+00:00",
+    )
+
+    dropdown = AlertDeleteDropdown(MagicMock(), [oversized_alert, normal_alert], "111")
+    assert len(dropdown.options) == 2
+    assert len(dropdown.options[0].label) <= 100
+    assert dropdown.options[0].label.endswith("...")
+    assert len(dropdown.options[0].description) <= 100
+    assert dropdown.options[0].description.endswith("...")
+    assert dropdown.options[1].label == "ID #12 • BTCUSDT ($72,000.00)"
+    assert dropdown.options[1].description == "ABOVE | Başlangıç: $68,000.00"
