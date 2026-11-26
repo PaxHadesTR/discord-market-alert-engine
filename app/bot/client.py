@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 from app.config import Settings
 from app.database.db import AlertRecord
+from app.routes.health import _redact_sensitive_text
 from app.market_data.symbols import (
     classify_and_normalize,
     get_symbol_autocomplete,
@@ -207,9 +208,9 @@ class AlertDeleteDropdown(discord.ui.Select):
         for a in alerts[:25]:  # Discord select menu max is 25 items
             options.append(
                 discord.SelectOption(
-                    label=f"ID #{a.id} • {a.symbol} ({format_price(a.target_price)})",
-                    value=str(a.id),
-                    description=f"{a.direction} | Başlangıç: {format_price(a.initial_price)}",
+                    label=_truncate_text(f"ID #{a.id} • {a.symbol} ({format_price(a.target_price)})", 100),
+                    value=str(a.id)[:100],
+                    description=_truncate_text(f"{a.direction} | Başlangıç: {format_price(a.initial_price)}", 100),
                     emoji="🗑",
                 )
             )
@@ -572,6 +573,8 @@ class DiscordAlertBot(commands.Bot):
         self.settings = settings
         self.active_proxy = proxy_url
         self.start_time = time.time()
+        self._watchlist_lock: Optional[asyncio.Lock] = None
+        self._watchlist_lock_loop: Optional[asyncio.AbstractEventLoop] = None
         self.engine.trigger_callback = self.dispatch_alert_notification
         logging.getLogger("discord.gateway").setLevel(logging.INFO)
         logging.getLogger("discord.client").setLevel(logging.INFO)
@@ -579,6 +582,14 @@ class DiscordAlertBot(commands.Bot):
             logger.info("Discord Bot configured with outbound proxy: %s", proxy_url)
         elif proxy_override is None and getattr(settings, "discord_proxy_list", []):
             logger.info("Discord Bot attempting direct connection (proxy fallback mode).")
+
+    def _get_watchlist_lock(self) -> asyncio.Lock:
+        """Return an asyncio.Lock bound to the active event loop for atomic watchlist quota enforcement."""
+        loop = asyncio.get_running_loop()
+        if self._watchlist_lock is None or self._watchlist_lock_loop is not loop:
+            self._watchlist_lock = asyncio.Lock()
+            self._watchlist_lock_loop = loop
+        return self._watchlist_lock
 
     async def setup_hook(self) -> None:
         """Register persistent dynamic items, slash command groups, and sync tree."""
@@ -600,32 +611,35 @@ class DiscordAlertBot(commands.Bot):
         """Global error handler for slash commands."""
         @self.tree.error
         async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+            safe_error = _redact_sensitive_text(error, max_length=1000)
             logger.error(
                 "Error executing command %s: %s",
                 interaction.command.name if interaction.command else "unknown",
-                error,
-                exc_info=True,
+                safe_error,
+                exc_info=(safe_error == " ".join(str(error).splitlines()).strip()),
             )
             err_str = str(error)
             is_proxy_err = "503" in err_str or "ClientHttpProxyError" in err_str or "Proxy" in err_str or "Cannot connect to host" in err_str
 
             if is_proxy_err:
-                proxy_label = self.active_proxy or "proxy"
+                proxy_label = _redact_sensitive_text(self.active_proxy) if self.active_proxy else "proxy"
                 msg = (
                     "⚠️ **Geçici Proxy Bağlantı Hatası (503):**\n"
                     f"> Discord proxy bağlantısında (`{proxy_label}`) anlık bir rota yenilenmesi veya kesinti yaşandı.\n"
                     "> Lütfen **5-10 saniye bekleyip komutu tekrar deneyin**. Sorun devam ederse sunucudaki `spoof-dpi` / `warp` konteynerlerini kontrol edin."
                 )
             else:
-                msg = f"⚠️ Komut işlenirken bir hata oluştu: {error}"
+                msg = "⚠️ Komut işlenirken beklenmeyen bir hata oluştu. Lütfen tekrar deneyin."
+
+            msg = _truncate_text(_sanitize_mentions(msg), MAX_DISCORD_CONTENT_LENGTH)
 
             try:
                 if interaction.response.is_done():
-                    await interaction.followup.send(msg, ephemeral=True)
+                    await interaction.followup.send(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
                 else:
-                    await interaction.response.send_message(msg, ephemeral=True)
+                    await interaction.response.send_message(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
             except Exception as send_err:
-                logger.debug("Could not deliver error message to Discord user: %s", send_err)
+                logger.debug("Could not deliver error message to Discord user: %s", _redact_sensitive_text(send_err))
 
     async def on_connect(self) -> None:
         """Invoked when bot establishes connection with Discord Gateway."""
@@ -926,23 +940,36 @@ class DiscordAlertBot(commands.Bot):
                 )
                 return
 
-            existing = await self.engine.db.get_user_watchlist(str(interaction.user.id))
-            if norm_symbol in existing:
+            user_id_str = str(interaction.user.id)
+            async with self._get_watchlist_lock():
+                existing = await self.engine.db.get_user_watchlist(user_id_str)
+                if norm_symbol in existing:
+                    already_exists = True
+                    quota_reached = False
+                    success = False
+                elif len(existing) >= MAX_WATCHLIST_ITEMS:
+                    already_exists = False
+                    quota_reached = True
+                    success = False
+                else:
+                    already_exists = False
+                    quota_reached = False
+                    success = await self.engine.db.add_to_watchlist(user_id_str, norm_symbol, asset_type)
+
+            if already_exists:
                 await safe_followup_send(
                     interaction,
                     content=f"ℹ️ **{norm_symbol}** zaten takip listenizde kayıtlı.",
                     ephemeral=True,
                 )
                 return
-            if len(existing) >= MAX_WATCHLIST_ITEMS:
+            if quota_reached:
                 await safe_followup_send(
                     interaction,
                     content=f"❌ Takip listesi limitine ({MAX_WATCHLIST_ITEMS}) ulaştınız. Yeni sembol eklemek için önce `/watchlist remove` kullanın.",
                     ephemeral=True,
                 )
                 return
-
-            success = await self.engine.db.add_to_watchlist(str(interaction.user.id), norm_symbol, asset_type)
 
             if success:
                 price = await self.engine.feed.get_current_price(norm_symbol)
@@ -1002,7 +1029,17 @@ class DiscordAlertBot(commands.Bot):
             uptime_hours, rem = divmod(uptime_seconds, 3600)
             uptime_mins, uptime_secs = divmod(rem, 60)
 
-            latency_ms = round(self.latency * 1000, 1) if self.latency else 0.0
+            raw_latency = self.latency
+            latency_ms = (
+                round(raw_latency * 1000, 1)
+                if (
+                    isinstance(raw_latency, (int, float))
+                    and not isinstance(raw_latency, bool)
+                    and math.isfinite(raw_latency)
+                    and raw_latency >= 0
+                )
+                else 0.0
+            )
 
             embed = discord.Embed(
                 title="📊 Sistem ve Bot İstatistikleri",
@@ -1080,14 +1117,6 @@ class DiscordAlertBot(commands.Bot):
 
         # 2. Standard Channel dispatch
         target_channel_id = self.settings.DISCORD_ALERT_CHANNEL_ID or int(alert.channel_id)
-        channel = self.get_channel(target_channel_id)
-
-        if not channel:
-            try:
-                channel = await self.fetch_channel(target_channel_id)
-            except Exception as e:
-                logger.error("Could not fetch Discord channel %s to dispatch alert: %s", target_channel_id, e)
-                return False
 
         delivered = False
         owner_mention_policy = discord.AllowedMentions(
@@ -1097,6 +1126,12 @@ class DiscordAlertBot(commands.Bot):
         )
         for attempt in range(1, 4):
             try:
+                channel = self.get_channel(target_channel_id)
+                if not channel:
+                    channel = await self.fetch_channel(target_channel_id)
+                if not channel:
+                    logger.error("Could not find Discord channel %s to dispatch alert.", target_channel_id)
+                    break
                 await channel.send(content=content, embed=embed, view=view, allowed_mentions=owner_mention_policy)
                 logger.info("Successfully announced alert #%d in Discord channel %s", alert.id, target_channel_id)
                 delivered = True

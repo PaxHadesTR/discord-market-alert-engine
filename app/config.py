@@ -1,5 +1,6 @@
 from functools import lru_cache
-from typing import List, Optional
+from typing import Any, List, Optional
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -48,6 +49,16 @@ class Settings(BaseSettings):
     RATE_LIMIT_PER_SECOND: float = 2.0
     MAX_QUEUE_CAPACITY: int = 500
     HTTP_TIMEOUT_SECONDS: float = 10.0
+
+    @field_validator("DISCORD_ALERT_CHANNEL_ID", mode="before")
+    @classmethod
+    def _coerce_blank_channel_id(cls, value: Any) -> Any:
+        """Treat blank DISCORD_ALERT_CHANNEL_ID env values (from .env.example) as None."""
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @property
     def is_discord_bot_configured(self) -> bool:

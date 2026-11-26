@@ -782,3 +782,360 @@ async def test_dispatch_alert_notification_dm_retry_fallback_and_channel_failure
             assert mock_sleep.await_count == 2
 
     await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_command_error_handler_redacts_proxy_credentials_and_hides_raw_exceptions():
+    """SEC-SECRETS-001: on_app_command_error redacts proxy userinfo, hides raw exception text, and bounds reply length."""
+    from discord import app_commands
+
+    u, p = "proxyacct", "proxypwd99"
+    proxy_url = f"http://{u}:{p}@proxy.internal:8080"
+
+    bot = DiscordAlertBot(
+        engine=MagicMock(),
+        settings=Settings(DISCORD_BOT_TOKEN="mock_token"),
+        proxy_override=proxy_url,
+    )
+    bot._setup_error_handler()
+
+    # 1. Proxy 503 error masks credentials in ephemeral response
+    inter_proxy = _make_mock_interaction(user_id=111)
+    inter_proxy.command = MagicMock(name="price")
+    inter_proxy.command.name = "price"
+    await bot.tree.on_error(inter_proxy, app_commands.AppCommandError(f"503 ClientHttpProxyError via {proxy_url}"))
+
+    proxy_msg = inter_proxy.response.send_message.call_args.args[0]
+    assert u not in proxy_msg and p not in proxy_msg
+    assert "http://***@proxy.internal:8080" in proxy_msg
+    assert len(proxy_msg) <= 2000
+    assert inter_proxy.response.send_message.call_args.kwargs["ephemeral"] is True
+
+    # 2. Non-proxy error never reflects raw exception internals or oversized strings
+    inter_generic = _make_mock_interaction(user_id=111)
+    inter_generic.command = MagicMock()
+    inter_generic.command.name = "alert"
+    inter_generic.response.is_done.return_value = True
+    secret_detail = "INTERNAL_DB_SECRET_" + ("X" * 3000)
+    await bot.tree.on_error(inter_generic, app_commands.AppCommandError(secret_detail))
+
+    generic_msg = inter_generic.followup.send.call_args.args[0]
+    assert "INTERNAL_DB_SECRET_" not in generic_msg
+    assert len(generic_msg) <= 2000
+    assert inter_generic.followup.send.call_args.kwargs["ephemeral"] is True
+
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_watchlist_add_concurrent_requests_never_exceed_quota(tmp_path):
+    """CONC-BOT-001: Concurrent /watchlist add commands serialize quota check + insert and never exceed MAX_WATCHLIST_ITEMS."""
+    import asyncio
+    from app.bot.client import MAX_WATCHLIST_ITEMS
+    from app.database.db import AlertDatabase
+
+    db = AlertDatabase(str(tmp_path / "wl_race.db"))
+    await db.init_db()
+    # Pre-populate 23 items so only 2 slots remain
+    for i in range(MAX_WATCHLIST_ITEMS - 2):
+        assert await db.add_to_watchlist("u1", f"SYM{i}", "EQUITY_FOREX") is True
+
+    orig_get = db.get_user_watchlist
+
+    async def slow_get(uid: str):
+        items = await orig_get(uid)
+        await asyncio.sleep(0.02)
+        return items
+
+    db.get_user_watchlist = slow_get
+
+    mock_engine = MagicMock()
+    mock_engine.db = db
+    mock_engine.feed = MagicMock()
+    mock_engine.feed.get_current_price = AsyncMock(return_value=100.0)
+
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    bot._register_commands()
+    add_cmd = bot.tree.get_command("watchlist").get_command("add")
+
+    # Fire 6 concurrent additions for distinct symbols when only 2 slots remain
+    interactions = [_make_mock_interaction(user_id=1) for _ in range(6)]
+    await asyncio.gather(
+        *[add_cmd.callback(inter, symbol=f"NEW{i}") for i, inter in enumerate(interactions)]
+    )
+
+    final_items = await orig_get("1")
+    # Wait: pre-populated user was "u1"; run again for user "1" with 23 pre-populated items!
+    assert len(final_items) == 6
+
+    # Now test actual cap enforcement for user "99" starting at MAX_WATCHLIST_ITEMS - 2
+    for i in range(MAX_WATCHLIST_ITEMS - 2):
+        assert await db.add_to_watchlist("99", f"BASE{i}", "EQUITY_FOREX") is True
+    cap_interactions = [_make_mock_interaction(user_id=99) for _ in range(6)]
+    await asyncio.gather(
+        *[add_cmd.callback(inter, symbol=f"CAP{i}") for i, inter in enumerate(cap_interactions)]
+    )
+    capped_items = await orig_get("99")
+    assert len(capped_items) == MAX_WATCHLIST_ITEMS
+    added_replies = sum(
+        1 for inter in cap_interactions if "takip listenize eklendi" in inter.followup.send.call_args.kwargs["content"]
+    )
+    rejected_replies = sum(
+        1 for inter in cap_interactions if "limitine" in inter.followup.send.call_args.kwargs["content"]
+    )
+    assert added_replies == 2
+    assert rejected_replies == 4
+
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_alert_notification_retries_transient_fetch_channel_errors():
+    """RES-BOT-001: Transient aiohttp/Timeout errors during fetch_channel retry and recover; exhaustion returns False."""
+    import asyncio
+    import aiohttp
+
+    mock_engine = MagicMock()
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token", DISCORD_ALERT_CHANNEL_ID=555))
+    alert = AlertRecord(
+        id=301,
+        user_id="111",
+        user_name="Trader",
+        channel_id="555",
+        guild_id=None,
+        symbol="BTCUSDT",
+        asset_type="CRYPTO",
+        target_price=70000.0,
+        initial_price=65000.0,
+        direction="ABOVE",
+        status="TRIGGERED",
+        created_at="2026-10-29T20:00:00+00:00",
+    )
+
+    ch = MagicMock()
+    ch.send = AsyncMock()
+    fetch_calls = 0
+
+    async def flaky_fetch(cid):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        if fetch_calls == 1:
+            raise aiohttp.ClientError("proxy 503")
+        if fetch_calls == 2:
+            raise asyncio.TimeoutError("gateway timeout")
+        return ch
+
+    with patch.object(bot, "is_closed", return_value=False), \
+         patch.object(bot, "is_ready", return_value=True), \
+         patch.object(bot, "get_channel", return_value=None), \
+         patch.object(bot, "fetch_channel", side_effect=flaky_fetch), \
+         patch("app.bot.client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        assert await bot.dispatch_alert_notification(alert, 71000.0) is True
+        assert fetch_calls == 3
+        ch.send.assert_awaited_once()
+        assert mock_sleep.await_count == 2
+
+        # Exhausted transient fetch_channel errors return False cleanly with 2 sleeps
+        mock_sleep.reset_mock()
+        with patch.object(bot, "fetch_channel", new_callable=AsyncMock, side_effect=aiohttp.ClientError("down")) as fail_fetch:
+            assert await bot.dispatch_alert_notification(alert, 71000.0) is False
+            assert fail_fetch.await_count == 3
+            assert mock_sleep.await_count == 2
+
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_stats_command_guards_nonfinite_and_negative_bot_latency():
+    """LOGIC-BOT-LATENCY-001: /stats defaults NaN/Inf/negative/bool latency to 0.0 ms and formats valid latency."""
+    mock_engine = MagicMock()
+    mock_engine.db = MagicMock()
+    mock_engine.db.get_database_stats = AsyncMock(
+        return_value={"active_alerts": 1, "triggered_alerts": 2, "watchlist_items": 3}
+    )
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    bot._register_commands()
+    stats_cmd = bot.tree.get_command("stats")
+
+    for bad_latency in (float("nan"), float("inf"), float("-inf"), -0.5, None, True):
+        inter = _make_mock_interaction(user_id=111)
+        with patch.object(type(bot), "latency", new_callable=lambda: property(lambda self, v=bad_latency: v)):
+            await stats_cmd.callback(inter)
+        embed = inter.followup.send.call_args.kwargs["embed"]
+        assert embed.fields[0].value == "`0.0 ms`"
+
+    inter_ok = _make_mock_interaction(user_id=111)
+    with patch.object(type(bot), "latency", new_callable=lambda: property(lambda self: 0.0426)):
+        await stats_cmd.callback(inter_ok)
+    assert inter_ok.followup.send.call_args.kwargs["embed"].fields[0].value == "`42.6 ms`"
+
+    await bot.close()
+
+
+def test_alert_delete_dropdown_enforces_100_char_select_option_limits():
+    """LOGIC-BOT-SELECT-LEN-001: AlertDeleteDropdown truncates oversized symbol/direction labels and descriptions <= 100 chars."""
+    from app.bot.client import AlertDeleteDropdown
+
+    oversized_alert = AlertRecord(
+        id=999999999,
+        user_id="111",
+        user_name="Trader",
+        channel_id="222",
+        guild_id=None,
+        symbol="LONG_LEGACY_SYMBOL_" + ("X" * 120),
+        asset_type="CRYPTO",
+        target_price=0.000000001234,
+        initial_price=0.000000001111,
+        direction="ABOVE_" + ("D" * 120),
+        status="ACTIVE",
+        created_at="2026-10-29T20:00:00+00:00",
+    )
+    normal_alert = AlertRecord(
+        id=12,
+        user_id="111",
+        user_name="Trader",
+        channel_id="222",
+        guild_id=None,
+        symbol="BTCUSDT",
+        asset_type="CRYPTO",
+        target_price=72000.0,
+        initial_price=68000.0,
+        direction="ABOVE",
+        status="ACTIVE",
+        created_at="2026-10-29T20:00:00+00:00",
+    )
+
+    dropdown = AlertDeleteDropdown(MagicMock(), [oversized_alert, normal_alert], "111")
+    assert len(dropdown.options) == 2
+    assert len(dropdown.options[0].label) <= 100
+    assert dropdown.options[0].label.endswith("...")
+    assert len(dropdown.options[0].description) <= 100
+    assert dropdown.options[0].description.endswith("...")
+    assert dropdown.options[1].label == "ID #12 • BTCUSDT ($72,000.00)"
+    assert dropdown.options[1].description == "ABOVE | Başlangıç: $68,000.00"
+
+
+@pytest.mark.asyncio
+async def test_bot_autocomplete_retry_helpers_dropdowns_and_watchlist_remove():
+    """V6-BOT-COV-001: Dual-path coverage for autocomplete, safe_defer/safe_followup_send, AlertDeleteDropdown, HelpCategorySelect, and watchlist_remove."""
+    import asyncio
+    import aiohttp
+    from app.bot.client import (
+        AlertDeleteDropdown,
+        HelpCategorySelect,
+        safe_defer,
+        safe_followup_send,
+        symbol_autocomplete_handler,
+    )
+
+    # 1. symbol_autocomplete_handler extracts yahoo_feed + price_cache and clamps 25 items / 100 chars
+    inter_ac = _make_mock_interaction(user_id=111)
+    fake_yahoo = MagicMock()
+    inter_ac.client = MagicMock()
+    inter_ac.client.engine.feed.yahoo = fake_yahoo
+    inter_ac.client.engine.feed.price_cache = {"BTCUSDT": (70000.0, 1.0), "ETHUSDT": (3500.0, 1.0)}
+    long_suggestions = [(f"LABEL_{i}_" + ("A" * 120), f"VAL_{i}_" + ("B" * 120)) for i in range(30)]
+
+    with patch("app.bot.client.get_symbol_autocomplete_async", new_callable=AsyncMock, return_value=long_suggestions) as mock_ac:
+        choices = await symbol_autocomplete_handler(inter_ac, "bt")
+        mock_ac.assert_awaited_once_with("bt", yahoo_feed=fake_yahoo, live_crypto_symbols=["BTCUSDT", "ETHUSDT"])
+        assert len(choices) == 25
+        assert all(len(c.name) <= 100 and len(c.value) <= 100 for c in choices)
+
+    # Works safely when client has no engine
+    inter_ac_empty = _make_mock_interaction(user_id=111)
+    inter_ac_empty.client = None
+    with patch("app.bot.client.get_symbol_autocomplete_async", new_callable=AsyncMock, return_value=[("BTC", "BTCUSDT")]) as mock_ac2:
+        choices_empty = await symbol_autocomplete_handler(inter_ac_empty, "btc")
+        mock_ac2.assert_awaited_once_with("btc", yahoo_feed=None, live_crypto_symbols=None)
+        assert len(choices_empty) == 1
+
+    # 2. safe_defer & safe_followup_send retry transient errors, fail fast on non-transient, and raise on exhaustion
+    with patch("app.bot.client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        inter_defer = _make_mock_interaction(user_id=111)
+        inter_defer.response.defer = AsyncMock(side_effect=[aiohttp.ClientError("503"), None])
+        assert await safe_defer(inter_defer, ephemeral=True, max_retries=3, retry_delay=0.01) is True
+        assert inter_defer.response.defer.await_count == 2
+        assert mock_sleep.await_count == 1
+
+        inter_defer_fail = _make_mock_interaction(user_id=111)
+        inter_defer_fail.response.defer = AsyncMock(side_effect=asyncio.TimeoutError("timeout"))
+        with pytest.raises(asyncio.TimeoutError):
+            await safe_defer(inter_defer_fail, max_retries=2, retry_delay=0.01)
+        assert inter_defer_fail.response.defer.await_count == 2
+
+        inter_defer_val = _make_mock_interaction(user_id=111)
+        inter_defer_val.response.defer = AsyncMock(side_effect=ValueError("bad"))
+        with pytest.raises(ValueError):
+            await safe_defer(inter_defer_val, max_retries=3, retry_delay=0.01)
+        assert inter_defer_val.response.defer.await_count == 1
+
+        inter_fu = _make_mock_interaction(user_id=111)
+        inter_fu.followup.send = AsyncMock(side_effect=[aiohttp.ClientError("503"), "ok_msg"])
+        res_fu = await safe_followup_send(inter_fu, max_retries=3, retry_delay=0.01, content="hello")
+        assert res_fu == "ok_msg"
+        assert inter_fu.followup.send.await_count == 2
+
+        inter_fu_fail = _make_mock_interaction(user_id=111)
+        inter_fu_fail.followup.send = AsyncMock(side_effect=aiohttp.ClientError("down"))
+        with pytest.raises(aiohttp.ClientError):
+            await safe_followup_send(inter_fu_fail, max_retries=2, retry_delay=0.01, content="hello")
+        assert inter_fu_fail.followup.send.await_count == 2
+
+    # 3. AlertDeleteDropdown callback: non-owner blocked, owner delete succeeds, missing alert reports failure
+    alert = AlertRecord(
+        id=42, user_id="111", user_name="Owner", channel_id="222", guild_id=None,
+        symbol="BTCUSDT", asset_type="CRYPTO", target_price=72000.0, initial_price=68000.0,
+        direction="ABOVE", status="ACTIVE", created_at="2026-10-29T20:00:00+00:00",
+    )
+    mock_engine = MagicMock()
+    mock_engine.db = MagicMock()
+    mock_engine.db.cancel_alert = AsyncMock(return_value=True)
+    dropdown = AlertDeleteDropdown(mock_engine, [alert], "111")
+    dropdown._values = ["42"]
+
+    inter_intruder = _make_mock_interaction(user_id=999)
+    await dropdown.callback(inter_intruder)
+    mock_engine.db.cancel_alert.assert_not_awaited()
+    assert inter_intruder.response.send_message.call_args.kwargs["ephemeral"] is True
+
+    inter_owner = _make_mock_interaction(user_id=111)
+    await dropdown.callback(inter_owner)
+    mock_engine.db.cancel_alert.assert_awaited_once_with(alert_id=42, user_id="111")
+    assert dropdown.disabled is True
+    inter_owner.response.edit_message.assert_awaited_once()
+    assert "#42" in inter_owner.followup.send.call_args.kwargs["content"]
+
+    mock_engine.db.cancel_alert = AsyncMock(return_value=False)
+    inter_missing = _make_mock_interaction(user_id=111)
+    await dropdown.callback(inter_missing)
+    assert "hata" in inter_missing.response.send_message.call_args.args[0]
+
+    # 4. HelpCategorySelect switches cleanly across all 5 categories
+    help_select = HelpCategorySelect()
+    seen_titles = set()
+    for cat in ("overview", "alerts", "market", "symbols", "tradingview"):
+        help_select._values = [cat]
+        inter_help = _make_mock_interaction(user_id=111)
+        await help_select.callback(inter_help)
+        embed = inter_help.response.edit_message.call_args.kwargs["embed"]
+        assert embed.title and embed.footer.text
+        seen_titles.add(embed.title)
+    assert len(seen_titles) == 5
+
+    # 5. /watchlist remove happy and not-found paths
+    mock_engine.db.remove_from_watchlist = AsyncMock(side_effect=[True, False])
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    bot._register_commands()
+    rm_cmd = bot.tree.get_command("watchlist").get_command("remove")
+
+    inter_rm_ok = _make_mock_interaction(user_id=111)
+    await rm_cmd.callback(inter_rm_ok, symbol="btc")
+    mock_engine.db.remove_from_watchlist.assert_any_await("111", "BTCUSDT")
+    assert "çıkarıldı" in inter_rm_ok.followup.send.call_args.kwargs["content"]
+
+    inter_rm_miss = _make_mock_interaction(user_id=111)
+    await rm_cmd.callback(inter_rm_miss, symbol="ETH")
+    assert "bulunamadı" in inter_rm_miss.followup.send.call_args.kwargs["content"]
+
+    await bot.close()

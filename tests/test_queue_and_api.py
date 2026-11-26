@@ -299,3 +299,122 @@ def test_readme_max_active_alerts_default_matches_settings():
     assert "MAX_ACTIVE_ALERTS=250" not in readme
     assert "`250` / `25`" not in readme
     assert f"`{default_cap}` / `25`" in readme
+
+
+def test_settings_accepts_blank_discord_alert_channel_id(monkeypatch):
+    """CONTRACT-CONFIG-CHANNEL-001: Blank DISCORD_ALERT_CHANNEL_ID coerces to None while valid ints and invalid text behave properly."""
+    from pydantic import ValidationError
+    from app.config import Settings
+
+    # Adversarial: blank and whitespace-only env values (as in .env.example) must not crash Settings
+    for blank in ("", "   "):
+        monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", blank)
+        s = Settings(_env_file=None)
+        assert s.DISCORD_ALERT_CHANNEL_ID is None
+
+    # Happy path: numeric channel ID parses as int
+    monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", "123456789012345678")
+    assert Settings(_env_file=None).DISCORD_ALERT_CHANNEL_ID == 123456789012345678
+
+    # Adversarial: non-numeric text still raises ValidationError
+    monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", "not-a-channel-id")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.asyncio
+async def test_queue_stop_drains_buffered_alerts_and_respects_drain_timeout():
+    """F-a51516a60fe6: stop() rejects new enqueues, drains buffered alerts before closing providers, and bounds hung providers."""
+    # 1. Happy path: buffered alerts are drained completely before stop() cancels worker and closes providers
+    dispatched_tickers = []
+    closed_after_count = None
+
+    class _SlowProvider:
+        async def send(self, alert: AlertPayload) -> bool:
+            await asyncio.sleep(0.02)
+            dispatched_tickers.append(alert.ticker)
+            return True
+
+        async def close(self) -> None:
+            nonlocal closed_after_count
+            closed_after_count = len(dispatched_tickers)
+
+    queue = AlertQueueService(
+        providers=[_SlowProvider()],
+        rate_limiter=AsyncTokenBucket(rate=1000.0),
+        max_capacity=20,
+    )
+    queue.start()
+    for i in range(4):
+        assert queue.enqueue(AlertPayload(ticker=f"COIN{i}USDT", action="BUY", price=100.0 + i)) is True
+
+    # Immediately call stop() without sleeping first -> all 4 buffered items must still drain
+    stop_task = asyncio.create_task(queue.stop(drain_timeout=2.0))
+    await asyncio.sleep(0)
+    assert queue.enqueue(AlertPayload(ticker="LATEUSDT", action="BUY")) is False
+    await stop_task
+
+    assert dispatched_tickers == ["COIN0USDT", "COIN1USDT", "COIN2USDT", "COIN3USDT"]
+    assert closed_after_count == 4
+    assert queue.stats["total_processed"] == 4
+    assert queue.stats["running"] is False
+
+    # 2. Adversarial: hung provider hits bounded drain_timeout, cancels cleanly, and closes provider
+    started = asyncio.Event()
+    hung = asyncio.Event()
+    hung_closed = False
+
+    class _HungProvider:
+        async def send(self, alert: AlertPayload) -> bool:
+            started.set()
+            await hung.wait()
+            return True
+
+        async def close(self) -> None:
+            nonlocal hung_closed
+            hung_closed = True
+
+    hung_queue = AlertQueueService(
+        providers=[_HungProvider()],
+        rate_limiter=AsyncTokenBucket(rate=1000.0),
+        max_capacity=10,
+    )
+    hung_queue.start()
+    assert hung_queue.enqueue(AlertPayload(ticker="HUNGUSDT", action="BUY")) is True
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    await asyncio.wait_for(hung_queue.stop(drain_timeout=0.05), timeout=1.0)
+    assert hung_closed is True
+    assert hung_queue._worker_task is None
+    assert hung_queue.queue._unfinished_tasks == 0
+
+
+@pytest.mark.asyncio
+async def test_lifespan_startup_failure_cleans_up_queue_worker_and_http_client(monkeypatch, tmp_path):
+    """F-10255b4da261: Failure in alert_engine.start() stops queue worker and closes DiscordWebhookProvider HTTP client."""
+    from unittest.mock import AsyncMock, patch
+    from fastapi import FastAPI
+    from app.config import get_settings
+    from app.main import lifespan
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "fail_startup.db"))
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/12345/abcdef")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "")
+    get_settings.cache_clear()
+
+    test_app = FastAPI()
+    try:
+        with patch("app.main.AutonomousAlertEngine.start", new_callable=AsyncMock, side_effect=OSError("disk full")), \
+             patch("app.main.AutonomousAlertEngine.stop", new_callable=AsyncMock) as mock_engine_stop:
+            with pytest.raises(OSError, match="disk full"):
+                async with lifespan(test_app):
+                    pass
+
+            mock_engine_stop.assert_awaited_once()
+            qs = test_app.state.queue_service
+            assert qs._worker_task is None
+            assert qs._running is False
+            assert len(qs.providers) == 1
+            assert qs.providers[0]._client.is_closed is True
+    finally:
+        get_settings.cache_clear()

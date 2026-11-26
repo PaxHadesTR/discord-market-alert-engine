@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import re
 from typing import Any, Dict, Optional, Tuple, Union
 from app.models.alert import AlertPayload
@@ -66,7 +67,15 @@ def parse_tradingview_payload(raw_body: Union[str, bytes, dict]) -> AlertPayload
 
 def _parse_price_string(raw: str) -> Optional[float]:
     """Parse US or European/Turkish formatted numeric strings (e.g., 68,500.25, 68.500,25, 68000,50, 1,234,567)."""
-    s = re.sub(r"[^\d\.,\-]", "", str(raw).strip())
+    stripped = str(raw).strip()
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)[eE][+-]?\d+", stripped):
+        try:
+            parsed_sci = float(stripped)
+            return parsed_sci if math.isfinite(parsed_sci) else None
+        except (ValueError, TypeError):
+            return None
+
+    s = re.sub(r"[^\d\.,\-]", "", stripped)
     if not s or s == "-":
         return None
     try:
@@ -85,7 +94,8 @@ def _parse_price_string(raw: str) -> Optional[float]:
                 s = s.replace(",", ".")
         elif s.count(".") > 1:
             s = s.replace(".", "")
-        return float(s)
+        parsed = float(s)
+        return parsed if math.isfinite(parsed) else None
     except (ValueError, TypeError):
         return None
 
@@ -116,9 +126,10 @@ def _from_dict(data: Dict[str, Any]) -> AlertPayload:
         or data.get("entry")
     )
     price: Optional[float] = None
-    if price_val is not None:
+    if price_val is not None and not isinstance(price_val, bool):
         if isinstance(price_val, (int, float)):
-            price = float(price_val)
+            candidate = float(price_val)
+            price = candidate if math.isfinite(candidate) else None
         else:
             price = _parse_price_string(str(price_val))
 

@@ -44,17 +44,47 @@ class AlertQueueService:
             self._running = False
             logger.debug("No active event loop running when starting queue; worker will attach when loop starts.")
 
-    async def stop(self) -> None:
-        """Gracefully stop the background worker and close providers (idempotent)."""
+    async def stop(self, drain_timeout: float = 5.0) -> None:
+        """Gracefully stop the background worker (draining buffered alerts) and close providers (idempotent)."""
         self._stopped = True
-        self._running = False
         if self._worker_task:
-            self._worker_task.cancel()
+            if not self._worker_task.done() and drain_timeout > 0:
+                join_task = asyncio.create_task(self.queue.join())
+                try:
+                    done, _ = await asyncio.wait(
+                        {join_task, self._worker_task},
+                        timeout=drain_timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if join_task not in done:
+                        join_task.cancel()
+                        try:
+                            await join_task
+                        except asyncio.CancelledError:
+                            pass
+                        if self._worker_task not in done:
+                            logger.warning(
+                                "AlertQueueService drain timed out after %.1fs with %d item(s) still queued; cancelling worker.",
+                                drain_timeout,
+                                self.queue.qsize(),
+                            )
+                except BaseException:
+                    join_task.cancel()
+                    try:
+                        await join_task
+                    except asyncio.CancelledError:
+                        pass
+                    raise
+            self._running = False
+            if not self._worker_task.done():
+                self._worker_task.cancel()
             try:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
             self._worker_task = None
+        else:
+            self._running = False
 
         if not self._providers_closed:
             self._providers_closed = True

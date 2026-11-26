@@ -115,42 +115,55 @@ async def lifespan(app: FastAPI):
     app.state.queue_service = queue_service
 
     # 2. Initialize Autonomous Market Engine & SQLite Storage
-    raw_secret = (settings.WEBHOOK_SECRET or "").strip()
-    if not raw_secret or raw_secret.lower() in INSECURE_DEFAULT_SECRETS:
-        logger.warning(
-            "WEBHOOK_SECRET is unset or uses an insecure placeholder. "
-            "TradingView webhook ingestion is locked (fail-closed) until a strong WEBHOOK_SECRET is configured."
+    alert_engine: Optional[AutonomousAlertEngine] = None
+    try:
+        raw_secret = (settings.WEBHOOK_SECRET or "").strip()
+        if not raw_secret or raw_secret.lower() in INSECURE_DEFAULT_SECRETS:
+            logger.warning(
+                "WEBHOOK_SECRET is unset or uses an insecure placeholder. "
+                "TradingView webhook ingestion is locked (fail-closed) until a strong WEBHOOK_SECRET is configured."
+            )
+
+        base_ws_url = settings.BINANCE_WS_URL.strip().rstrip("/")
+        stream_suffix = "/!miniTicker@arr"
+        binance_ws_url = base_ws_url if base_ws_url.endswith(stream_suffix) else f"{base_ws_url}{stream_suffix}"
+
+        yahoo_poll_interval = max(1.0, float(settings.YAHOO_POLL_INTERVAL_SECONDS))
+        cache_ttl_seconds = max(0.1, float(settings.CACHE_TTL_SECONDS))
+        http_timeout_seconds = max(1.0, float(settings.HTTP_TIMEOUT_SECONDS))
+
+        db = AlertDatabase(db_path=settings.SQLITE_DB_PATH)
+        binance_feed = BinanceMarketFeed(
+            ws_url=binance_ws_url,
+            timeout_seconds=http_timeout_seconds,
         )
-
-    base_ws_url = settings.BINANCE_WS_URL.strip().rstrip("/")
-    stream_suffix = "/!miniTicker@arr"
-    binance_ws_url = base_ws_url if base_ws_url.endswith(stream_suffix) else f"{base_ws_url}{stream_suffix}"
-
-    yahoo_poll_interval = max(1.0, float(settings.YAHOO_POLL_INTERVAL_SECONDS))
-    cache_ttl_seconds = max(0.1, float(settings.CACHE_TTL_SECONDS))
-    http_timeout_seconds = max(1.0, float(settings.HTTP_TIMEOUT_SECONDS))
-
-    db = AlertDatabase(db_path=settings.SQLITE_DB_PATH)
-    binance_feed = BinanceMarketFeed(
-        ws_url=binance_ws_url,
-        timeout_seconds=http_timeout_seconds,
-    )
-    yahoo_feed = YahooFinanceFeed(
-        poll_interval_seconds=yahoo_poll_interval,
-        timeout_seconds=http_timeout_seconds,
-    )
-    price_feed = UnifiedPriceFeed(
-        binance_feed=binance_feed,
-        yahoo_feed=yahoo_feed,
-        cache_ttl_seconds=cache_ttl_seconds,
-    )
-    alert_engine = AutonomousAlertEngine(
-        db=db,
-        price_feed=price_feed,
-        settings=settings,
-    )
-    await alert_engine.start()
-    app.state.alert_engine = alert_engine
+        yahoo_feed = YahooFinanceFeed(
+            poll_interval_seconds=yahoo_poll_interval,
+            timeout_seconds=http_timeout_seconds,
+        )
+        price_feed = UnifiedPriceFeed(
+            binance_feed=binance_feed,
+            yahoo_feed=yahoo_feed,
+            cache_ttl_seconds=cache_ttl_seconds,
+        )
+        alert_engine = AutonomousAlertEngine(
+            db=db,
+            price_feed=price_feed,
+            settings=settings,
+        )
+        await alert_engine.start()
+        app.state.alert_engine = alert_engine
+    except BaseException:
+        if alert_engine is not None:
+            try:
+                await alert_engine.stop()
+            except Exception as cleanup_err:
+                logger.warning("Error stopping alert_engine after startup failure: %s", cleanup_err)
+        try:
+            await queue_service.stop()
+        except Exception as cleanup_err:
+            logger.warning("Error stopping queue_service after startup failure: %s", cleanup_err)
+        raise
 
     # 3. Initialize Discord Bot with Resilient Supervisor Loop
     bot_task: Optional[asyncio.Task] = None

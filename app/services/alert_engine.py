@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import re
 from typing import Callable, Coroutine, List, Optional, Set, Tuple, Union
 from app.config import Settings
 from app.database.db import AlertDatabase, AlertRecord
@@ -64,14 +65,46 @@ def parse_target_price_input(
         multiplier = 1000000.0
         clean = clean[:-1].strip()
 
-    clean = clean.replace(" ", "").replace(",", ".")
+    invalid_format_msg = f"Geçersiz fiyat formatı: '{target_input}'. Örnekler: 70000, 150.5, +5%, -3%, 70k"
+    clean = clean.replace(" ", "")
+    if not re.fullmatch(r"[+-]?(?:\d+(?:[.,]\d+)*|\.\d+|,\d+)", clean):
+        return None, invalid_format_msg
+
+    if "," in clean and "." in clean:
+        if clean.rfind(",") > clean.rfind("."):
+            # European/Turkish format: 68.500,25
+            int_part, dec_part = clean.rsplit(",", 1)
+            if not re.fullmatch(r"[+-]?(?:\d{1,3}(?:\.\d{3})+|\d+)", int_part) or "." in dec_part:
+                return None, invalid_format_msg
+            clean = int_part.replace(".", "") + "." + dec_part
+        else:
+            # US format: 68,500.25
+            int_part, dec_part = clean.rsplit(".", 1)
+            if not re.fullmatch(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)", int_part) or "," in dec_part:
+                return None, invalid_format_msg
+            clean = int_part.replace(",", "") + "." + dec_part
+    elif "," in clean:
+        if clean.count(",") > 1:
+            if not re.fullmatch(r"[+-]?[1-9]\d{0,2}(?:,\d{3})+", clean):
+                return None, invalid_format_msg
+            clean = clean.replace(",", "")
+        elif re.fullmatch(r"[+-]?[1-9]\d{0,2},\d{3}", clean):
+            # US thousands grouping: $65,000 or 68,450 (not 0,525 or 66000,50)
+            clean = clean.replace(",", "")
+        else:
+            clean = clean.replace(",", ".")
+    elif clean.count(".") > 1:
+        if not re.fullmatch(r"[+-]?[1-9]\d{0,2}(?:\.\d{3})+", clean):
+            return None, invalid_format_msg
+        clean = clean.replace(".", "")
+
     try:
         val = float(clean) * multiplier
         if not math.isfinite(val) or val <= 0:
             return None, "Hedef fiyat 0'dan büyük sonlu ve pozitif bir sayı olmalıdır."
         return val, None
     except ValueError:
-        return None, f"Geçersiz fiyat formatı: '{target_input}'. Örnekler: 70000, 150.5, +5%, -3%, 70k"
+        return None, invalid_format_msg
 
 
 class AutonomousAlertEngine:
@@ -256,6 +289,21 @@ class AutonomousAlertEngine:
                                     alert.id,
                                 )
                                 await self.db.reset_alert_to_active(alert.id)
+                        except asyncio.CancelledError:
+                            logger.warning(
+                                "Trigger callback cancelled for alert #%d; resetting to ACTIVE for retry.",
+                                alert.id,
+                            )
+                            try:
+                                await asyncio.shield(self.db.reset_alert_to_active(alert.id))
+                            except Exception as reset_err:
+                                logger.error(
+                                    "Failed resetting cancelled alert #%d to ACTIVE: %s",
+                                    alert.id,
+                                    reset_err,
+                                    exc_info=True,
+                                )
+                            raise
                         except Exception as e:
                             logger.error(
                                 "Error executing alert trigger callback for alert #%d: %s; resetting to ACTIVE for retry.",
