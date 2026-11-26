@@ -943,3 +943,30 @@ async def test_dispatch_alert_notification_retries_transient_fetch_channel_error
             assert mock_sleep.await_count == 2
 
     await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_stats_command_guards_nonfinite_and_negative_bot_latency():
+    """LOGIC-BOT-LATENCY-001: /stats defaults NaN/Inf/negative/bool latency to 0.0 ms and formats valid latency."""
+    mock_engine = MagicMock()
+    mock_engine.db = MagicMock()
+    mock_engine.db.get_database_stats = AsyncMock(
+        return_value={"active_alerts": 1, "triggered_alerts": 2, "watchlist_items": 3}
+    )
+    bot = DiscordAlertBot(engine=mock_engine, settings=Settings(DISCORD_BOT_TOKEN="mock_token"))
+    bot._register_commands()
+    stats_cmd = bot.tree.get_command("stats")
+
+    for bad_latency in (float("nan"), float("inf"), float("-inf"), -0.5, None, True):
+        inter = _make_mock_interaction(user_id=111)
+        with patch.object(type(bot), "latency", new_callable=lambda: property(lambda self, v=bad_latency: v)):
+            await stats_cmd.callback(inter)
+        embed = inter.followup.send.call_args.kwargs["embed"]
+        assert embed.fields[0].value == "`0.0 ms`"
+
+    inter_ok = _make_mock_interaction(user_id=111)
+    with patch.object(type(bot), "latency", new_callable=lambda: property(lambda self: 0.0426)):
+        await stats_cmd.callback(inter_ok)
+    assert inter_ok.followup.send.call_args.kwargs["embed"].fields[0].value == "`42.6 ms`"
+
+    await bot.close()

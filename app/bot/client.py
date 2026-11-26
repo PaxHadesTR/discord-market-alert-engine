@@ -1029,7 +1029,17 @@ class DiscordAlertBot(commands.Bot):
             uptime_hours, rem = divmod(uptime_seconds, 3600)
             uptime_mins, uptime_secs = divmod(rem, 60)
 
-            latency_ms = round(self.latency * 1000, 1) if self.latency else 0.0
+            raw_latency = self.latency
+            latency_ms = (
+                round(raw_latency * 1000, 1)
+                if (
+                    isinstance(raw_latency, (int, float))
+                    and not isinstance(raw_latency, bool)
+                    and math.isfinite(raw_latency)
+                    and raw_latency >= 0
+                )
+                else 0.0
+            )
 
             embed = discord.Embed(
                 title="📊 Sistem ve Bot İstatistikleri",
