@@ -299,3 +299,24 @@ def test_readme_max_active_alerts_default_matches_settings():
     assert "MAX_ACTIVE_ALERTS=250" not in readme
     assert "`250` / `25`" not in readme
     assert f"`{default_cap}` / `25`" in readme
+
+
+def test_settings_accepts_blank_discord_alert_channel_id(monkeypatch):
+    """CONTRACT-CONFIG-CHANNEL-001: Blank DISCORD_ALERT_CHANNEL_ID coerces to None while valid ints and invalid text behave properly."""
+    from pydantic import ValidationError
+    from app.config import Settings
+
+    # Adversarial: blank and whitespace-only env values (as in .env.example) must not crash Settings
+    for blank in ("", "   "):
+        monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", blank)
+        s = Settings(_env_file=None)
+        assert s.DISCORD_ALERT_CHANNEL_ID is None
+
+    # Happy path: numeric channel ID parses as int
+    monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", "123456789012345678")
+    assert Settings(_env_file=None).DISCORD_ALERT_CHANNEL_ID == 123456789012345678
+
+    # Adversarial: non-numeric text still raises ValidationError
+    monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", "not-a-channel-id")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
