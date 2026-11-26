@@ -320,3 +320,70 @@ def test_settings_accepts_blank_discord_alert_channel_id(monkeypatch):
     monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", "not-a-channel-id")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+@pytest.mark.asyncio
+async def test_queue_stop_drains_buffered_alerts_and_respects_drain_timeout():
+    """F-a51516a60fe6: stop() rejects new enqueues, drains buffered alerts before closing providers, and bounds hung providers."""
+    # 1. Happy path: buffered alerts are drained completely before stop() cancels worker and closes providers
+    dispatched_tickers = []
+    closed_after_count = None
+
+    class _SlowProvider:
+        async def send(self, alert: AlertPayload) -> bool:
+            await asyncio.sleep(0.02)
+            dispatched_tickers.append(alert.ticker)
+            return True
+
+        async def close(self) -> None:
+            nonlocal closed_after_count
+            closed_after_count = len(dispatched_tickers)
+
+    queue = AlertQueueService(
+        providers=[_SlowProvider()],
+        rate_limiter=AsyncTokenBucket(rate=1000.0),
+        max_capacity=20,
+    )
+    queue.start()
+    for i in range(4):
+        assert queue.enqueue(AlertPayload(ticker=f"COIN{i}USDT", action="BUY", price=100.0 + i)) is True
+
+    # Immediately call stop() without sleeping first -> all 4 buffered items must still drain
+    stop_task = asyncio.create_task(queue.stop(drain_timeout=2.0))
+    await asyncio.sleep(0)
+    assert queue.enqueue(AlertPayload(ticker="LATEUSDT", action="BUY")) is False
+    await stop_task
+
+    assert dispatched_tickers == ["COIN0USDT", "COIN1USDT", "COIN2USDT", "COIN3USDT"]
+    assert closed_after_count == 4
+    assert queue.stats["total_processed"] == 4
+    assert queue.stats["running"] is False
+
+    # 2. Adversarial: hung provider hits bounded drain_timeout, cancels cleanly, and closes provider
+    started = asyncio.Event()
+    hung = asyncio.Event()
+    hung_closed = False
+
+    class _HungProvider:
+        async def send(self, alert: AlertPayload) -> bool:
+            started.set()
+            await hung.wait()
+            return True
+
+        async def close(self) -> None:
+            nonlocal hung_closed
+            hung_closed = True
+
+    hung_queue = AlertQueueService(
+        providers=[_HungProvider()],
+        rate_limiter=AsyncTokenBucket(rate=1000.0),
+        max_capacity=10,
+    )
+    hung_queue.start()
+    assert hung_queue.enqueue(AlertPayload(ticker="HUNGUSDT", action="BUY")) is True
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    await asyncio.wait_for(hung_queue.stop(drain_timeout=0.05), timeout=1.0)
+    assert hung_closed is True
+    assert hung_queue._worker_task is None
+    assert hung_queue.queue._unfinished_tasks == 0
