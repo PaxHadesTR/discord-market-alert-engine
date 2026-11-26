@@ -603,3 +603,53 @@ async def test_parse_target_price_input_handles_us_and_eu_thousands_grouping(set
         val, err = parse_target_price_input(bad, 65000.0)
         assert val is None, f"Expected rejection for {bad!r}, got {val!r}"
         assert err is not None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_trigger_callback_rolls_back_alert_to_active(setup_engine):
+    """RES-ENGINE-001: Cancelling _on_price_tick mid-callback rolls alert back to ACTIVE and re-raises CancelledError."""
+    import asyncio
+
+    engine, _, _ = setup_engine
+    ok, _, rec = await engine.create_user_alert(
+        user_id="u_cancel", user_name="Trader", channel_id="c1", guild_id="g1",
+        raw_symbol="BTCUSDT", target_price=70000.0,
+    )
+    assert ok is True and rec is not None
+
+    entered = asyncio.Event()
+    stall = asyncio.Event()
+
+    async def slow_callback(alert, price):
+        entered.set()
+        await stall.wait()
+        return True
+
+    engine.trigger_callback = slow_callback
+
+    task = asyncio.create_task(engine._on_price_tick("BTCUSDT", 71000.0))
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+    # Confirm DB transitioned to TRIGGERED while callback is in-flight
+    assert (await engine.db.get_alert_by_id(rec.id)).status == "TRIGGERED"
+
+    # Cancel in-flight dispatch task -> CancelledError propagates AND alert is rolled back to ACTIVE
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    rolled_back = await engine.db.get_alert_by_id(rec.id)
+    assert rolled_back.status == "ACTIVE"
+    assert "BTCUSDT" in engine._active_symbols
+
+    # Happy path: subsequent healthy callback delivers and marks alert TRIGGERED
+    delivered = []
+
+    async def healthy_callback(alert, price):
+        delivered.append((alert.id, price))
+        return True
+
+    engine.trigger_callback = healthy_callback
+    await engine._on_price_tick("BTCUSDT", 71500.0)
+    assert delivered == [(rec.id, 71500.0)]
+    assert (await engine.db.get_alert_by_id(rec.id)).status == "TRIGGERED"

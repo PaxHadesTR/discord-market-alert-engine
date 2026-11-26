@@ -289,6 +289,21 @@ class AutonomousAlertEngine:
                                     alert.id,
                                 )
                                 await self.db.reset_alert_to_active(alert.id)
+                        except asyncio.CancelledError:
+                            logger.warning(
+                                "Trigger callback cancelled for alert #%d; resetting to ACTIVE for retry.",
+                                alert.id,
+                            )
+                            try:
+                                await asyncio.shield(self.db.reset_alert_to_active(alert.id))
+                            except Exception as reset_err:
+                                logger.error(
+                                    "Failed resetting cancelled alert #%d to ACTIVE: %s",
+                                    alert.id,
+                                    reset_err,
+                                    exc_info=True,
+                                )
+                            raise
                         except Exception as e:
                             logger.error(
                                 "Error executing alert trigger callback for alert #%d: %s; resetting to ACTIVE for retry.",
