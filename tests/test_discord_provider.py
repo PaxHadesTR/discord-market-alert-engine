@@ -313,3 +313,56 @@ async def test_discord_bot_provider_checks_ready_and_retries_transient_errors():
         assert await provider_bad.send(alert) is False
         assert bad_ch.send.await_count == 1
         mock_sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_providers_format_zero_sub_1e8_negative_and_nonfinite_prices():
+    """DATA-FORMAT-001: Webhook and Bot providers never emit '$0.', '$-5.', '$nan', or '$inf'."""
+    from unittest.mock import AsyncMock, MagicMock
+    from app.providers.discord import DiscordBotNotificationProvider
+
+    webhook = DiscordWebhookProvider(webhook_url="https://discord.com/api/webhooks/123/abc")
+
+    # Happy & edge finite values
+    expected_cases = [
+        (0.0, "`$0.00`"),
+        (1e-9, "`$0.000000001`"),
+        (1e-15, "`$1.00e-15`"),
+        (-5.0, "`-$5.0000`"),
+        (0.00012300, "`$0.000123`"),
+        (68450.5, "`$68,450.50`"),
+    ]
+    for raw_price, expected_val in expected_cases:
+        alert = AlertPayload(ticker="TEST", action="BUY", price=raw_price)
+        body = webhook.build_discord_payload(alert)
+        price_fields = [f["value"] for f in body["embeds"][0]["fields"] if f["name"] == "💵 Price"]
+        assert price_fields == [expected_val]
+        assert price_fields[0] != "`$0.`" and "$-" not in price_fields[0]
+
+    # Adversarial non-finite prices are omitted rather than formatted as '$nan'/'$inf'
+    for bad_price in (float("nan"), float("inf"), float("-inf")):
+        alert = AlertPayload(ticker="TEST", action="BUY", price=bad_price)
+        body = webhook.build_discord_payload(alert)
+        assert [f for f in body["embeds"][0]["fields"] if f["name"] == "💵 Price"] == []
+
+    # Same guarantees in DiscordBotNotificationProvider.send
+    sent_embeds = []
+    ch = MagicMock()
+    ch.send = AsyncMock(side_effect=lambda embed=None: sent_embeds.append(embed))
+    bot = MagicMock()
+    bot.is_closed.return_value = False
+    bot.is_ready.return_value = True
+    bot.get_channel.return_value = ch
+
+    bot_provider = DiscordBotNotificationProvider(bot=bot, channel_id=999)
+    assert await bot_provider.send(AlertPayload(ticker="TEST", action="BUY", price=0.0)) is True
+    assert await bot_provider.send(AlertPayload(ticker="TEST", action="BUY", price=1e-9)) is True
+    assert await bot_provider.send(AlertPayload(ticker="TEST", action="BUY", price=-5.0)) is True
+    assert await bot_provider.send(AlertPayload(ticker="TEST", action="BUY", price=float("nan"))) is True
+
+    assert sent_embeds[0].fields[0].value == "`$0.00`"
+    assert sent_embeds[1].fields[0].value == "`$0.000000001`"
+    assert sent_embeds[2].fields[0].value == "`-$5.0000`"
+    assert [f for f in sent_embeds[3].fields if f.name == "💵 Fiyat"] == []
+
+    await webhook.close()

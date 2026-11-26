@@ -36,6 +36,27 @@ def _wrap_code_value(value: Any, max_length: int = MAX_EMBED_FIELD_VALUE) -> str
     return f"`{_truncate_str(raw, inner_max)}`"
 
 
+def _format_discord_price(price: Any) -> Optional[str]:
+    """Format finite numeric prices safely for Discord embeds (handles 0, <1e-8, negatives; rejects bool/non-finite)."""
+    if price is None or isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price):
+        return None
+    if price == 0:
+        return "$0.00"
+    abs_price = abs(price)
+    sign = "-" if price < 0 else ""
+    if abs_price > 10.0:
+        return f"{sign}${abs_price:,.2f}"
+    if abs_price >= 1.0:
+        return f"{sign}${abs_price:.4f}"
+    if abs_price >= 1e-8:
+        formatted = f"{abs_price:.8f}".rstrip("0").rstrip(".")
+        return f"{sign}${formatted}"
+    formatted = f"{abs_price:.12f}".rstrip("0").rstrip(".")
+    if formatted in ("", "0"):
+        return f"{sign}${abs_price:.2e}"
+    return f"{sign}${formatted}"
+
+
 def _enforce_embed_limits(
     title: str,
     description: Optional[str],
@@ -200,12 +221,9 @@ class DiscordWebhookProvider(BaseNotificationProvider):
         fields: List[Dict[str, Any]] = []
 
         if alert.price is not None:
-            # Format price nicely
-            if alert.price >= 1.0:
-                price_str = f"${alert.price:,.2f}" if alert.price > 10 else f"${alert.price:.4f}"
-            else:
-                price_str = f"${alert.price:.8f}".rstrip("0")
-            fields.append({"name": "💵 Price", "value": f"`{price_str}`", "inline": True})
+            price_str = _format_discord_price(alert.price)
+            if price_str is not None:
+                fields.append({"name": "💵 Price", "value": f"`{price_str}`", "inline": True})
 
         if alert.strategy:
             fields.append({"name": "🎯 Strategy", "value": _wrap_code_value(alert.strategy), "inline": True})
@@ -290,11 +308,9 @@ class DiscordBotNotificationProvider(BaseNotificationProvider):
 
             raw_fields: List[Dict[str, Any]] = []
             if alert.price is not None:
-                if alert.price >= 1.0:
-                    price_str = f"${alert.price:,.2f}" if alert.price > 10 else f"${alert.price:.4f}"
-                else:
-                    price_str = f"${alert.price:.8f}".rstrip("0")
-                raw_fields.append({"name": "💵 Fiyat", "value": _wrap_code_value(price_str), "inline": True})
+                price_str = _format_discord_price(alert.price)
+                if price_str is not None:
+                    raw_fields.append({"name": "💵 Fiyat", "value": _wrap_code_value(price_str), "inline": True})
             if alert.strategy:
                 raw_fields.append({"name": "🎯 Strateji", "value": _wrap_code_value(alert.strategy), "inline": True})
             if alert.timeframe:
