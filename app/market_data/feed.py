@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 from typing import Callable, Coroutine, Dict, List, Optional, Tuple
 from app.market_data.binance import BinanceMarketFeed
@@ -9,6 +10,16 @@ from app.market_data.yahoo import YahooFinanceFeed
 logger = logging.getLogger(__name__)
 
 PriceListener = Callable[[str, float], Coroutine[None, None, None]]
+
+
+def _is_valid_price(price: object) -> bool:
+    """Return True only for finite, strictly positive non-boolean numeric prices."""
+    return (
+        not isinstance(price, bool)
+        and isinstance(price, (int, float))
+        and math.isfinite(price)
+        and price > 0
+    )
 
 
 class UnifiedPriceFeed:
@@ -46,26 +57,34 @@ class UnifiedPriceFeed:
 
         if normalized in self.price_cache:
             cached_price, cached_at = self.price_cache[normalized]
-            if (now - cached_at) <= self.cache_ttl:
-                return cached_price
+            if (now - cached_at) <= self.cache_ttl and _is_valid_price(cached_price):
+                return float(cached_price)
 
         if asset_type == "CRYPTO":
             price = await self.binance.fetch_price(normalized)
         else:
             price = await self.yahoo.fetch_price(normalized)
 
-        if price is not None:
-            self.price_cache[normalized] = (price, now)
-        return price
+        if not _is_valid_price(price):
+            return None
+
+        valid_price = float(price)
+        self.price_cache[normalized] = (valid_price, now)
+        return valid_price
 
     async def _handle_price_tick(self, symbol: str, price: float) -> None:
         """Internal dispatch called whenever Binance or Yahoo reports a price."""
+        if not _is_valid_price(price):
+            logger.debug("Ignoring invalid upstream price tick %r for %s", price, symbol)
+            return
+
+        valid_price = float(price)
         symbol_upper = symbol.upper()
-        self.price_cache[symbol_upper] = (price, time.time())
+        self.price_cache[symbol_upper] = (valid_price, time.time())
 
         # Notify listeners concurrently
         if self._listeners:
-            tasks = [listener(symbol_upper, price) for listener in self._listeners]
+            tasks = [listener(symbol_upper, valid_price) for listener in self._listeners]
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def start(self) -> None:
