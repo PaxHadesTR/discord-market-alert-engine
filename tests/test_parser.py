@@ -136,3 +136,30 @@ def test_parse_plain_text_thousands_and_european_formats():
 
     a6 = parse_tradingview_payload("XRPUSDT BUY 0,525 Small decimal")
     assert a6.price == 0.525
+
+
+def test_parse_rejects_nonfinite_and_boolean_prices():
+    """F-61eb07a9a02a: Reject NaN, Infinity, -Infinity, overflowing scientific strings, and bool prices."""
+    adversarial_payloads = [
+        '{"ticker": "BTCUSDT", "action": "BUY", "price": NaN}',
+        '{"ticker": "BTCUSDT", "action": "BUY", "price": Infinity}',
+        '{"ticker": "BTCUSDT", "action": "BUY", "price": -Infinity}',
+        '{"ticker": "BTCUSDT", "action": "BUY", "price": 1e309}',
+        '{"ticker": "BTCUSDT", "action": "BUY", "price": "1e309"}',
+        '{"ticker": "BTCUSDT", "action": "BUY", "price": "' + ("9" * 400) + '"}',
+        '{"ticker": "BTCUSDT", "action": "BUY", "price": true}',
+        '{"ticker": "BTCUSDT", "action": "BUY", "price": false}',
+        {"ticker": "BTCUSDT", "action": "BUY", "price": float("nan")},
+        {"ticker": "BTCUSDT", "action": "BUY", "price": float("inf")},
+        {"ticker": "BTCUSDT", "action": "BUY", "price": True},
+    ]
+    for raw in adversarial_payloads:
+        alert = parse_tradingview_payload(raw)
+        assert alert.ticker == "BTCUSDT"
+        assert alert.price is None
+
+    # Happy path: valid scientific notation and finite numeric prices still parse
+    valid_sci = parse_tradingview_payload('{"ticker": "PEPEUSDT", "action": "BUY", "price": "1.5e-5"}')
+    assert valid_sci.price == 1.5e-5
+    valid_num = parse_tradingview_payload('{"ticker": "BTCUSDT", "action": "BUY", "price": 68500.25}')
+    assert valid_num.price == 68500.25
